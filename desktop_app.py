@@ -8,13 +8,15 @@ import json
 import websocket # pip install websocket-client
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QWidget, QVBoxLayout, QTextEdit
 from PyQt6.QtGui import QIcon, QAction, QPixmap, QColor, QFont, QPainter, QBrush
-from PyQt6.QtCore import Qt, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 import fcntl
 from pynput import keyboard
 
 class Communicator(QObject):
     response_received = pyqtSignal(str)
     recording_changed = pyqtSignal(bool)
+    ui_ready = pyqtSignal() # New signal for thread-safe UI enablement
+
 
 class ResponseModal(QWidget):
     def __init__(self):
@@ -57,14 +59,19 @@ class StatusbarAssistant:
     def __init__(self, app):
         self.app = app
         self.server_process = None
+        self.whatsapp_process = None
         self.ui_process = None
         self.is_alt_pressed = False
         self.active_keys = set()
         self.communicator = Communicator()
         self.communicator.response_received.connect(self.display_modal)
         self.communicator.recording_changed.connect(self.update_tray_icon)
+        self.communicator.ui_ready.connect(self.enable_ui_and_hotkeys)
+        
+        self.ui_enabled = False # Hotkeys and Icon hidden until server ready
         
         subprocess.run(["pkill", "-f", "sentience_server"], stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "-f", "whatsapp_connector"], stderr=subprocess.DEVNULL)
         import time
         time.sleep(1.0)
         
@@ -111,21 +118,81 @@ class StatusbarAssistant:
         restart_action.triggered.connect(self.restart_agent)
         self.menu.addAction(restart_action)
         
+        # WhatsApp Integration Toggle
+        self.wa_action = QAction("WhatsApp Integration (Beta)", self.menu)
+        self.wa_action.setCheckable(True)
+        try:
+            settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+            if os.path.exists(settings_path):
+                with open(settings_path, "r") as f:
+                    settings = json.load(f)
+                    self.wa_action.setChecked(settings.get("whatsapp_enabled", True))
+            else:
+                self.wa_action.setChecked(True)
+        except:
+            self.wa_action.setChecked(True)
+            
+        self.wa_action.triggered.connect(self.toggle_whatsapp)
+        self.menu.addAction(self.wa_action)
+        
+        # Start WhatsApp if enabled
+        if self.wa_action.isChecked():
+            QTimer.singleShot(2000, self.start_whatsapp) # Slight delay for server warmup
+        
         quit_action = QAction("Quit", self.menu)
         quit_action.triggered.connect(self.quit_app)
         self.menu.addAction(quit_action)
         
         self.tray_icon.setContextMenu(self.menu)
         self.tray_icon.activated.connect(self.tray_activated)
-        self.tray_icon.show()
-        
-        # Start hotkey listener
-        self.hotkey_thread = threading.Thread(target=self.run_hotkey_listener, daemon=True)
-        self.hotkey_thread.start()
+        # self.tray_icon.show()  <-- HELD UNTIL READY
         
         # Start backend monitor (WebSocket)
         self.ws_thread = threading.Thread(target=self.monitor_backend, daemon=True)
         self.ws_thread.start()
+
+    def enable_ui_and_hotkeys(self):
+        """Called once the server is fully initialized."""
+        if self.ui_enabled:
+            return
+        self.ui_enabled = True
+        print("DEBUG: Enabling UI and Hotkey Listener...")
+        self.tray_icon.show()
+        
+        # Start hotkey listener only now
+        self.hotkey_thread = threading.Thread(target=self.run_hotkey_listener, daemon=True)
+        self.hotkey_thread.start()
+
+    def monitor_server_logs(self):
+        """Pipes server logs to console and waits for ready signal."""
+        if not self.server_process or not self.server_process.stdout:
+            return
+            
+        import time
+        # The user's specific trigger string, made more robust
+        trigger_fragment = "connection open"
+        
+        print("DEBUG: Log monitoring thread started. Watching for 'connection open'...")
+        
+        for line in self.server_process.stdout:
+            # Print EXACTLY what we received to debug
+            sys.stdout.write(f"Server: {line}")
+            sys.stdout.flush()
+            
+            if trigger_fragment.lower() in line.lower():
+                print(f"DEBUG: Trigger MATCHED on line: {repr(line)}")
+                print("DEBUG: Waiting 1 second for stabilization...")
+                time.sleep(1.0)
+                # Ensure we call UI updates on the main thread via Signal
+                print("DEBUG: Emitting ui_ready signal now...")
+                self.communicator.ui_ready.emit()
+                # Keep piping logs but we don't need to check trigger anymore
+                break
+        
+        # Continue piping logs for the rest of the session
+        for line in self.server_process.stdout:
+            sys.stdout.write(f"Server: {line}")
+            sys.stdout.flush()
 
     def create_solid_icon(self, hex_color):
         pixmap = QPixmap(32, 32)
@@ -152,13 +219,61 @@ class StatusbarAssistant:
         python_exe = os.path.join(script_dir, ".venv", "bin", "python3")
         server_script = os.path.join(script_dir, "sentience_server.py")
         if os.path.exists(python_exe) and os.path.exists(server_script):
-            self.server_process = subprocess.Popen([python_exe, server_script])
+            print("DEBUG: Launching Sentience Server process...")
+            self.server_process = subprocess.Popen(
+                [python_exe, server_script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            # Monitor logs in a separate thread
+            threading.Thread(target=self.monitor_server_logs, daemon=True).start()
+
+    def start_whatsapp(self):
+        if self.whatsapp_process and self.whatsapp_process.poll() is None:
+            return
+            
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        wa_script = os.path.join(script_dir, "whatsapp_connector.js")
+        if os.path.exists(wa_script):
+            print("DEBUG: Starting WhatsApp Connector...")
+            # Use Node to run the script. It will print QR code to terminal if needed.
+            self.whatsapp_process = subprocess.Popen(["node", wa_script])
+
+    def stop_whatsapp(self):
+        if self.whatsapp_process:
+            print("DEBUG: Stopping WhatsApp Connector...")
+            self.whatsapp_process.terminate()
+            self.whatsapp_process = None
+
+    def toggle_whatsapp(self):
+        enabled = self.wa_action.isChecked()
+        if enabled:
+            self.start_whatsapp()
+        else:
+            self.stop_whatsapp()
+        
+        # Persist to settings.json
+        try:
+            settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+            settings = {}
+            if os.path.exists(settings_path):
+                with open(settings_path, "r") as f:
+                    settings = json.load(f)
+            settings["whatsapp_enabled"] = enabled
+            with open(settings_path, "w") as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"DEBUG: Failed to save WhatsApp setting: {e}")
 
     def run_hotkey_listener(self):
         with keyboard.Listener(on_press=self.on_press, on_release=self.on_release) as listener:
             listener.join()
 
     def on_press(self, key):
+        if not self.ui_enabled:
+            return
         self.active_keys.add(key)
         
         # Check for Alt + \
@@ -227,6 +342,14 @@ class StatusbarAssistant:
         while True:
             try:
                 ws = websocket.create_connection("ws://localhost:8345/v1/realtime")
+                # Register with the same session as the Chat UI so we receive its responses
+                ws.send(json.dumps({
+                    "type": "session.update",
+                    "session": {
+                        "session_id": "default_user",
+                        "client_type": "modal"
+                    }
+                }))
                 while True:
                     result = ws.recv()
                     msg = json.loads(result)
@@ -268,6 +391,8 @@ class StatusbarAssistant:
         print("DEBUG: Restarting Sentience Agent...")
         if self.server_process:
             self.server_process.terminate()
+        if self.whatsapp_process:
+            self.whatsapp_process.terminate()
         # Soft-quit the PyQt app so the parent start.sh loop can continue, or simply os.execl
         import sys
         import os
@@ -301,6 +426,7 @@ class StatusbarAssistant:
 
     def quit_app(self):
         if self.server_process: self.server_process.terminate()
+        if self.whatsapp_process: self.whatsapp_process.terminate()
         self.app.quit()
         self.app.quit()
 

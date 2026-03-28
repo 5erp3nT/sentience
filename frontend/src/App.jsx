@@ -166,6 +166,10 @@ const App = () => {
 
   const startRecording = async () => {
     interruptAudio();
+    if (isRecording || streamRef.current) {
+      console.log("DEBUG: Cleaning up existing microphone stream to prevent overlap leak.");
+      stopRecording();
+    }
     try {
       console.log("DEBUG: Attempting to start recording...");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 } });

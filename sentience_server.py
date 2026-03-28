@@ -59,22 +59,36 @@ inference_lock = asyncio.Lock()
 active_websockets = set() # Track for broadcasting triggers
 voice_clients = set() # Track specifically for mic-capable tabs
 primary_voice_client = None # The one that responds to hotkeys
+whatsapp_contacts = {} # Shared state: JID -> {'name': str, 'last_seen': str}
+socket_to_session = {} # WS -> session_id mapping for targeted routing
 
-async def broadcast_to_uis(message, target_ws=None):
+async def broadcast_to_uis(message, target_ws=None, session_id=None):
+    """Send a message to UI clients.
+    - target_ws: send ONLY to this specific websocket.
+    - session_id: send to ALL websockets registered to this session.
+    - neither: broadcast to ALL connected websockets.
+    """
     if target_ws:
         try:
             await target_ws.send_json(message)
-            return # Only send to the requester
+            return
         except Exception:
             active_websockets.discard(target_ws)
             voice_clients.discard(target_ws)
+            socket_to_session.pop(target_ws, None)
+        return
 
-    for ws in active_websockets.copy():
+    targets = active_websockets.copy()
+    if session_id:
+        targets = {ws for ws, sid in socket_to_session.items() if sid == session_id}
+
+    for ws in targets:
         try:
             await ws.send_json(message)
         except Exception:
             active_websockets.discard(ws)
             voice_clients.discard(ws)
+            socket_to_session.pop(ws, None)
 
 def get_available_skills():
     """Scan skills directory for SKILL.md files and extract frontmatter."""
@@ -119,6 +133,8 @@ def load_settings():
     return {
         "api_key": "",
         "model": "mistralai/mistral-7b-instruct:free",
+        "multimodal_model": "google/gemini-1.5-flash",
+        "heavy_thinker_model": "google/gemini-pro-1.5",
         "assistant_name": "Antigravity",
         "system_prompt": "You are a helpful and concise AI assistant living in the user's Linux status bar."
     }
@@ -131,6 +147,8 @@ def save_settings(settings):
 class SettingsUpdate(BaseModel):
     api_key: str
     model: str
+    multimodal_model: str = "google/gemini-1.5-flash"
+    heavy_thinker_model: str = "google/gemini-pro-1.5"
     assistant_name: str
     system_prompt: str
 
@@ -147,6 +165,8 @@ def update_settings(update: SettingsUpdate):
     settings = load_settings()
     settings["api_key"] = update.api_key
     settings["model"] = update.model
+    settings["multimodal_model"] = update.multimodal_model
+    settings["heavy_thinker_model"] = update.heavy_thinker_model
     settings["assistant_name"] = update.assistant_name
     settings["system_prompt"] = update.system_prompt
     save_settings(settings)
@@ -210,6 +230,24 @@ async def trigger_stop():
         await broadcast_to_uis({"type": "control.recording.stop"})
     return {"status": "ok"}
 
+@app.post("/v1/whatsapp/contacts")
+async def update_whatsapp_contacts(contacts: dict):
+    global whatsapp_contacts
+    whatsapp_contacts.update(contacts)
+    return {"status": "ok"}
+
+@app.post("/v1/whatsapp/log")
+async def log_whatsapp_message(data: dict):
+    jid = data.get("jid")
+    name = data.get("name")
+    text = data.get("text")
+    if jid and text:
+        # Record into memory quietly without triggering a turn
+        # We include the name for better searchability later
+        memory.add_message(jid, "user", f"(Message from {name}): {text}")
+        print(f"DEBUG: Passive Awareness - Logged WhatsApp from {name}")
+    return {"status": "ok"}
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     return HTMLResponse("")
@@ -238,6 +276,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 if message.get('session', {}).get('session_id'):
                     session_id = message['session']['session_id']
                     print(f"DEBUG: Session initialized for user: {session_id}")
+                
+                # Register this websocket's session for targeted routing
+                socket_to_session[websocket] = session_id
                 
                 if message.get('session', {}).get('client_type') == 'voice':
                     voice_clients.add(websocket)
@@ -291,10 +332,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif message['type'] == 'input_text':
                 text_input = message.get('text', '')
-                print(f"DEBUG: Received text input: '{text_input}'")
-                if text_input.strip():
+                images_input = message.get('images', [])
+                print(f"DEBUG: Received text input: '{text_input}' with {len(images_input)} images")
+                if text_input.strip() or images_input:
                     # Echo the text just in case UI didn't naturally log it, but UI should.
-                    await process_llm_response(websocket, session_id, text_input)
+                    await process_llm_response(websocket, session_id, text_input, images_input)
 
     except Exception:
         # Prune common disconnects silently
@@ -302,6 +344,7 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         active_websockets.discard(websocket)
         voice_clients.discard(websocket)
+        socket_to_session.pop(websocket, None)
         if primary_voice_client == websocket:
             primary_voice_client = next(iter(voice_clients)) if voice_clients else None
             print(f"DEBUG: Primary client disconnected. New primary: {primary_voice_client}")
@@ -421,6 +464,55 @@ TOOLS = [
                 "required": ["query"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_whatsapp_message",
+            "description": "Send a WhatsApp message to a specific contact or number.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": "The contact NAME (e.g. 'Ryan'), WhatsApp JID (e.g. '12345@s.whatsapp.net'), OR a phone number."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The text message to send."
+                    }
+                },
+                "required": ["to", "message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_whatsapp_contacts",
+            "description": "List recently seen WhatsApp contacts and their IDs/JIDs. Use this if you need to find someone's ID to message them.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "switch_to_heavy_thinker",
+            "description": "Switch to the user's configured Heavy Thinker model for the rest of this response. Call this ONLY when the question requires deep multi-step reasoning, complex math, nuanced analysis, or careful long-form thinking that the main model might struggle with. Do NOT call this for simple factual questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief reason why the heavy thinker is needed."
+                    }
+                },
+                "required": ["reason"]
+            }
+        }
     }
 ]
 
@@ -453,6 +545,21 @@ async def execute_tool(name: str, arguments: dict) -> str:
         query = arguments.get("query", "")
         results = memory.search_memory(query)
         return json.dumps({"results": results})
+    elif name == "send_whatsapp_message":
+        to = arguments.get("to", "")
+        msg = arguments.get("message", "")
+        # Broadcast to all UIs/Connectors. The WhatsApp connector remains listening.
+        asyncio.create_task(broadcast_to_uis({
+            "type": "whatsapp.send_message",
+            "jid": to,
+            "text": msg
+        }))
+        return f"Message sent to {to}."
+    elif name == "list_whatsapp_contacts":
+        return json.dumps(whatsapp_contacts) if whatsapp_contacts else "No WhatsApp contacts seen yet."
+    elif name == "switch_to_heavy_thinker":
+        reason = arguments.get("reason", "complex reasoning required")
+        return f"__SWITCH_HEAVY_THINKER__: {reason}"
     return f"Unknown tool: {name}"
 
 async def do_get_weather(location: str) -> str:
@@ -524,12 +631,27 @@ async def do_run_command(command: str) -> str:
     except Exception as e:
         return f"Command error: {str(e)}"
 
+llm_lock = asyncio.Lock()
 
-async def process_llm_response(websocket: WebSocket, session_id: str, user_text: str):
+async def process_llm_response(websocket: WebSocket, session_id: str, user_text: str, images: list = None):
+    async with llm_lock:
+        await _process_llm_response_locked(websocket, session_id, user_text, images)
+
+async def _process_llm_response_locked(websocket: WebSocket, session_id: str, user_text: str, images: list = None):
     settings = load_settings()
     api_key = settings.get("api_key")
-    selected_model = settings.get("model", "google/gemma-2-9b-it:free")
-    
+    main_model = settings.get("model", "google/gemma-2-9b-it:free")
+    multimodal_model = settings.get("multimodal_model", "google/gemini-1.5-flash")
+    heavy_thinker_model = settings.get("heavy_thinker_model", "google/gemini-pro-1.5")
+
+    # Dynamic model selection
+    if images:
+        selected_model = multimodal_model
+        print(f"DEBUG: Switching to multimodal model: {selected_model}")
+        await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "multimodal"}, session_id=session_id)
+    else:
+        selected_model = main_model
+
     if not api_key:
         await websocket.send_json({
             "type": "response.ai_text.delta",
@@ -538,7 +660,17 @@ async def process_llm_response(websocket: WebSocket, session_id: str, user_text:
         await websocket.send_json({"type": "response.ai_text.done", "text": "Error"})
         return
         
-    memory.add_message(session_id, "user", user_text)
+    log_text = user_text
+    if images and not log_text.strip():
+        log_text = "[Image Attached]"
+    elif images:
+        log_text = f"[Image Attached] {log_text}"
+        
+    # ONLY add to memory if it's not already the latest message in history
+    # This avoids duplication between passive logging and interactive turns
+    recent_check = memory.get_recent_messages(session_id, limit=1)
+    if not recent_check or recent_check[0]["content"] != log_text:
+        memory.add_message(session_id, "user", log_text)
     
     # Retrieve relevant history context
     relevant_facts = memory.search_memory(user_text, top_k=5)
@@ -546,7 +678,7 @@ async def process_llm_response(websocket: WebSocket, session_id: str, user_text:
     identity_facts = memory.search_memory("user identity location residence history", top_k=3)
     
     unique_facts = list(set(relevant_facts + identity_facts))
-    recent_messages = memory.get_recent_messages(session_id, limit=15)
+    recent_messages = memory.get_recent_messages(session_id, limit=20)
     
     assistant_name = settings.get("assistant_name", "AI Assistant")
     base_prompt = settings.get("system_prompt", "You are a helpful AI.")
@@ -578,7 +710,8 @@ async def process_llm_response(websocket: WebSocket, session_id: str, user_text:
         "1. REAL-TIME: Always use tools for facts. Use 'web_search' for news/current events.\n"
         "2. WEATHER: Always try 'get_weather' first. If it fails, IMMEDIATELY use 'web_search' for weather snippets.\n"
         "3. MEMORY: Always use 'record_memory' for personal details. Don't ask, just do it.\n"
-        "4. HISTORY: Use 'search_memory' for cross-session context.\n\n"
+        "4. HISTORY: Use 'search_memory' for cross-session context.\n"
+        "5. SUMMARIZE: After using any tool, you MUST provide a concise summary or answer based on the results. NEVER return an empty response after a tool has executed.\n\n"
         f"{skills_summary}"
         "GUIDELINES:\n"
         "- Use DURABLE MEMORY as your core truth."
@@ -595,11 +728,43 @@ async def process_llm_response(websocket: WebSocket, session_id: str, user_text:
 
     messages = [{"role": "system", "content": system_prompt}]
     
-    for msg in recent_messages: # Include all recent messages
-        messages.append({"role": msg["role"], "content": msg["content"]})
+    # Process history and handle images
+    for i, msg in enumerate(recent_messages):
+        is_last = (i == len(recent_messages) - 1)
+        role = msg["role"]
+        content = msg["content"]
+        
+        # If this is the last message and we have active images, transform it into multimodal content
+        if is_last and role == "user" and images:
+            content_array = []
+            if user_text:
+                content_array.append({"type": "text", "text": user_text})
+            else:
+                # Fallback to the logged text if user_text is empty
+                content_array.append({"type": "text", "text": content})
+                
+            for img_b64 in images:
+                content_array.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                })
+            messages.append({"role": "user", "content": content_array})
+        else:
+            messages.append({"role": role, "content": content})
     
-    messages.append({"role": "user", "content": user_text})
-    
+    # Final check: if history was empty or didn't end with a user role (unlikely), add it now
+    if not any(m["role"] == "user" for m in messages[-2:]):
+        if images:
+            content_array = [{"type": "text", "text": user_text}] if user_text else []
+            for img_b64 in images:
+                content_array.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                })
+            messages.append({"role": "user", "content": content_array})
+        else:
+            messages.append({"role": "user", "content": user_text})
+
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
@@ -658,11 +823,11 @@ async def process_llm_response(websocket: WebSocket, session_id: str, user_text:
                     "tool_calls": tool_calls_json
                 })
                 
-                # Show "Thinking..." once per tool execution round
+                # Show "Thinking..." only to clients in this session
                 await broadcast_to_uis({
                     "type": "response.ai_text.delta",
                     "delta": "💭 Thinking...\n\n"
-                })
+                }, session_id=session_id)
                 
                 # Execute each tool call
                 for tool_call in (choice.message.tool_calls or []):
@@ -674,6 +839,13 @@ async def process_llm_response(websocket: WebSocket, session_id: str, user_text:
 
                     
                     result = await execute_tool(fn_name, fn_args)
+
+                    # Detect heavy thinker signal and switch model for subsequent calls
+                    if isinstance(result, str) and result.startswith("__SWITCH_HEAVY_THINKER__"):
+                        selected_model = heavy_thinker_model
+                        reason = result.replace("__SWITCH_HEAVY_THINKER__: ", "")
+                        print(f"DEBUG: Switching to heavy thinker model: {selected_model} ({reason})")
+                        await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "heavy_thinker"}, session_id=session_id)
                     
                     # Gemini/OpenRouter logic: tool result must match tool_call_id
                     messages.append({
@@ -687,26 +859,29 @@ async def process_llm_response(websocket: WebSocket, session_id: str, user_text:
             
             # Final text response
             content = choice.message.content or ""
-            # Robust LaTeX stripping: remove $, backslashes followed by words, and curly braces
+            print(f"DEBUG: Raw LLM Response (Iter {iteration}): '{content}'")
+            
+            # Refined LaTeX stripping: only remove if it looks like a Swarrow or specific common LaTeX artifacts
             import re
-            # Remove $ delimiters
             content = content.replace("$", "")
-            # Remove patterns like \swarrow or \text{...}
-            content = re.sub(r'\\[a-zA-Z]+(\{.*?\})?', '', content, flags=re.DOTALL)
-            # Remove empty parentheses/brackets left over from stripping
-            content = content.replace("()", "").replace("[]", "")
-            # General cleanup of remaining braces if they were LaTeX related
+            # Only strip specific backslash commands that are known to be problematic, instead of all \words
+            content = re.sub(r'\\(swarrow|text|frac|sqrt|cdot|times|alpha|beta|gamma)', '', content)
             content = content.replace("\\", "").replace("{}", "")
             
             final_text = content.strip()
-            print(f"DEBUG: Clean LLM Response: {final_text}")
-            if not final_text and iteration == 0:
-                final_text = "[The model didn't provide an answer or tool call. Try a different model.]"
+            print(f"DEBUG: Clean LLM Response: '{final_text}'")
+            
+            if not final_text:
+                if iteration == 0:
+                    final_text = "[The model didn't provide an answer or tool call. Try a different model.]"
+                else:
+                    # If we reached here after tool calls and it's still empty, it's a failure to summarize
+                    final_text = "[Error: The model provided tool results but failed to summarize them. Please try again.]"
             
             await broadcast_to_uis({
                 "type": "response.ai_text.done",
                 "text": final_text
-            }, target_ws=websocket)
+            }, session_id=session_id)
             
             memory.add_message(session_id, "assistant", final_text)
 
@@ -728,10 +903,15 @@ async def process_llm_response(websocket: WebSocket, session_id: str, user_text:
                             clean_for_tts, voice='af_bella',
                             speed=1.0, split_pattern=r'\n+'
                         )
+                        import numpy as np
+                        audio_chunks = []
                         for _, _, audio in generator:
-                            # 'audio' is a numpy array
+                            audio_chunks.append(audio)
+                        
+                        if audio_chunks:
+                            combined_audio = np.concatenate(audio_chunks)
                             with io.BytesIO() as wav_io:
-                                sf.write(wav_io, audio, 24000, format='WAV')
+                                sf.write(wav_io, combined_audio, 24000, format='WAV')
                                 wav_bytes = wav_io.getvalue()
                                 base64_audio = base64.b64encode(wav_bytes).decode('utf-8')
                                 await broadcast_to_uis({
