@@ -1,0 +1,6 @@
+{
+    "api_key": "YOUR_OPENROUTER_API_KEY_HERE",
+    "model": "google/gemini-2.5-flash-lite-preview-09-2025",
+    "assistant_name": "Antigravity",
+    "system_prompt": "You are a helpful and concise AI assistant living in the user's Linux status bar."
+}

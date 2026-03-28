@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.env
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Sensitive Configuration
+settings.json
+whatsapp_sessions/
+
+# Frontend Build Artifacts
+frontend/dist/
+frontend/node_modules/
+
+# Databases and Data
+memory.db
+memory.db-shm
+memory.db-wal
+chroma_db/
+*.wav
+*.mp3
+
+# Logs
+*.log
+vllm_log.txt
+voxtral_error.log
+voxtral_raw_output.log
+wget-log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project specific
+sentience-model.gguf
+/tmp/sentience_desktop.lock
