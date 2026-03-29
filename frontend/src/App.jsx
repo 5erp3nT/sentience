@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Mic, MicOff, Settings as SettingsIcon, Send, MessageSquare, Copy, Check } from 'lucide-react';
+import { Mic, MicOff, Settings as SettingsIcon, Send, MessageSquare, Copy, Check, Paperclip, X, FileText, Image as ImageIcon } from 'lucide-react';
 import useWebSocket, { ReadyState } from 'react-use-websocket';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -68,12 +68,19 @@ const App = () => {
   const [interimUserText, setInterimUserText] = useState('');
   const [interimAiText, setInterimAiText] = useState('');
   const [textInput, setTextInput] = useState('');
+  const [attachments, setAttachments] = useState([]); // {id, name, type, data, preview}
   const [showSettings, setShowSettings] = useState(false);
+  const [currentModel, setCurrentModel] = useState({ id: '', reason: '' });
+
 
   const audioContextRef = useRef(null);
   const streamRef = useRef(null);
   const workletNodeRef = useRef(null);
   const messagesEndRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const textareaRef = useRef(null);
+
+
 
   const audioQueueRef = useRef([]);
   const isPlayingRef = useRef(false);
@@ -122,12 +129,22 @@ const App = () => {
     scrollToBottom();
   }, [messages, interimUserText, interimAiText]);
 
+
+  // Auto-resize textarea
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 200)}px`;
+    }
+  }, [textInput]);
+
+
   useEffect(() => {
     if (lastJsonMessage) {
       const { type, delta, text } = lastJsonMessage;
 
       if (type === 'response.audio_transcript.delta') {
-        setInterimUserText(prev => prev + delta);
+        setInterimUserText(delta);
       } else if (type === 'response.audio_transcript.done') {
         if (text || interimUserText) {
           setMessages(prev => [...prev, { role: 'user', content: text || interimUserText }]);
@@ -152,17 +169,95 @@ const App = () => {
         if (!isPlayingRef.current) {
           playNextAudio();
         }
+      } else if (type === 'response.model_switch') {
+        setCurrentModel({ id: lastJsonMessage.model, reason: lastJsonMessage.reason });
       }
     }
   }, [lastJsonMessage]);
 
   const handleSendText = () => {
     interruptAudio();
-    if (!textInput.trim()) return;
-    setMessages(prev => [...prev, { role: 'user', content: textInput.trim() }]);
-    sendJsonMessage({ type: 'input_text', text: textInput.trim() });
+    if (!textInput.trim() && attachments.length === 0) return;
+    
+    // Optimistic UI: add message to list
+    const content = textInput.trim();
+    setMessages(prev => [...prev, { 
+      role: 'user', 
+      content: content || (attachments.length > 0 ? "[Attached Files]" : ""),
+      attachments: attachments.map(a => ({ name: a.name, type: a.type })) // Just for UI record
+    }]);
+
+    sendJsonMessage({ 
+      type: 'input_text', 
+      text: content,
+      attachments: attachments.map(a => ({
+        name: a.name,
+        type: a.type,
+        data: a.data.split(',')[1] // Send raw base64 without prefix
+      }))
+    });
+
     setTextInput('');
+    setAttachments([]);
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
   };
+
+  const handlePaste = async (e) => {
+    const items = e.clipboardData.items;
+    for (const item of items) {
+      if (item.type.indexOf('image') !== -1) {
+        const file = item.getAsFile();
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const base64Data = event.target.result;
+          setAttachments(prev => [...prev, {
+            id: Math.random().toString(36).substr(2, 9),
+            name: `Pasted Image ${new Date().toLocaleTimeString()}`,
+            type: file.type || 'image/png', // Default to png if type is empty from clipboard
+            data: base64Data,
+            preview: base64Data
+          }]);
+
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+  };
+
+
+  const handleFileSelect = async (e) => {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+
+    for (const file of files) {
+      if (file.size > 10 * 1024 * 1024) {
+        alert(`File ${file.name} is too large (> 10MB)`);
+        continue;
+      }
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const base64Data = event.target.result;
+        const isImage = file.type.startsWith('image/');
+        
+        setAttachments(prev => [...prev, {
+          id: Math.random().toString(36).substr(2, 9),
+          name: file.name,
+          type: file.type,
+          data: base64Data,
+          preview: isImage ? base64Data : null
+        }]);
+      };
+      reader.readAsDataURL(file);
+    }
+    // Reset input so same file can be picked again
+    e.target.value = '';
+  };
+
+  const removeAttachment = (id) => {
+    setAttachments(prev => prev.filter(a => a.id !== id));
+  };
+
 
   const startRecording = async () => {
     interruptAudio();
@@ -244,6 +339,13 @@ const App = () => {
         <div className="status-indicator">
           <div className={`dot ${isConnected ? 'online' : 'offline'}`} />
           <span>{isConnected ? 'Sentience Online' : 'Reconnecting...'}</span>
+          {currentModel.id && (
+            <div className={`model-badge-mini ${currentModel.reason}`}>
+              {currentModel.reason === 'screenshot' ? '👁️' : 
+               currentModel.reason === 'heavy_thinker' ? '🧠' : '✨'} 
+              {currentModel.id.split('/').pop()}
+            </div>
+          )}
         </div>
         <button className="icon-btn no-drag" onClick={() => setShowSettings(true)}>
           <SettingsIcon size={18} />
@@ -286,33 +388,78 @@ const App = () => {
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="input-area">
-        <input 
-          type="text" 
-          value={textInput}
-          onChange={(e) => setTextInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleSendText()}
-          placeholder="Type or speak..."
-          disabled={!isConnected}
-        />
-        
-        {textInput.trim() ? (
-          <button className="send-btn" onClick={handleSendText}>
-            <Send size={18} />
-          </button>
-        ) : (
-          <button 
-            className={`mic-btn ${isRecording ? 'recording' : ''}`}
-            onMouseDown={startRecording}
-            onMouseUp={stopRecording}
-            onMouseLeave={isRecording ? stopRecording : undefined}
-            disabled={!isConnected}
-            title="Hold to speak"
-          >
-            {isRecording ? <MicOff size={18} /> : <Mic size={18} />}
-          </button>
+      <div className="input-area-wrapper">
+        {attachments.length > 0 && (
+          <div className="attachment-preview-area">
+            {attachments.map(at => (
+              <div key={at.id} className="attachment-chip">
+                {at.preview ? (
+                  <img src={at.preview} alt="preview" className="chip-thumb" />
+                ) : (
+                  <FileText size={14} className="chip-icon" />
+                )}
+                <span className="chip-name">{at.name}</span>
+                <button className="chip-remove" onClick={() => removeAttachment(at.id)}>
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
         )}
+        <div className="input-area">
+          <input 
+            type="file" 
+            ref={fileInputRef} 
+            style={{ display: 'none' }} 
+            onChange={handleFileSelect}
+            multiple
+            accept="image/*,application/pdf,text/plain"
+          />
+          <button 
+            className="icon-btn no-drag" 
+            onClick={() => fileInputRef.current?.click()}
+            title="Attach files or images"
+          >
+            <Paperclip size={20} />
+          </button>
+          
+          <textarea 
+            ref={textareaRef}
+            value={textInput}
+            onChange={(e) => setTextInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleSendText();
+              }
+            }}
+            onPaste={handlePaste}
+            placeholder="Type or speak..."
+            disabled={!isConnected}
+            rows={1}
+          />
+          
+          {(textInput.trim() || attachments.length > 0) ? (
+            <button className="send-btn" onClick={handleSendText} style={{ marginBottom: '4px' }}>
+              <Send size={18} />
+            </button>
+          ) : (
+            <button 
+              className={`mic-btn ${isRecording ? 'recording' : ''}`}
+              onMouseDown={startRecording}
+              onMouseUp={stopRecording}
+              onMouseLeave={isRecording ? stopRecording : undefined}
+              disabled={!isConnected}
+              title="Hold to speak"
+              style={{ marginBottom: '4px' }}
+            >
+              {isRecording ? <MicOff size={18} /> : <Mic size={18} />}
+            </button>
+          )}
+
+        </div>
       </div>
+
     </div>
   );
 };

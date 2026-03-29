@@ -163,7 +163,20 @@ const Settings = ({ onClose }) => {
     return `$${(val * 1_000_000).toFixed(2)} / 1M`;
   };
 
-  const visionFilter = m => m.architecture?.modality?.includes('image');
+  const visionFilter = m => 
+    m.architecture?.modality?.includes('image') || 
+    m.architecture?.input_modalities?.includes('image') ||
+    m.id.toLowerCase().includes('vision') ||
+    m.id.toLowerCase().includes('gemini'); // Gemini models are multimodal by default
+
+  const standardFilter = m => !m.id.toLowerCase().includes('instruct') || m.id.toLowerCase().includes('it'); // Prefer IT/Instruct models
+
+  const heavyFilter = m => 
+    (m.context_length >= 120000 || m.id.toLowerCase().includes('pro') || m.id.toLowerCase().includes('opus') || m.id.toLowerCase().includes('405b') || m.id.toLowerCase().includes('70b')) && 
+    !m.id.toLowerCase().includes('mini') && // Mini models are usually 'Main' not 'Heavy'
+    !m.id.toLowerCase().includes('flash') && // Flash models are usually 'Main' or 'Multimodal'
+    !m.id.toLowerCase().includes('gemma'); // Gemma is usually 'Main'
+
 
   return (
     <div className="settings-overlay">
@@ -193,13 +206,15 @@ const Settings = ({ onClose }) => {
             </div>
 
             <ModelSelector
-              label="Main Model"
-              badge={{ cls: 'tools', icon: '🔧', text: 'Tool-capable only' }}
+              label="Standard Model"
+              badge={{ cls: 'tools', icon: '🔧', text: 'Fast / Daily' }}
               modelId={model}
               setModelId={setModel}
               availableModels={availableModels}
               formatPrice={formatPrice}
+              filterFn={standardFilter}
             />
+
 
             <ModelSelector
               label="Multi-modal Model"
@@ -213,12 +228,14 @@ const Settings = ({ onClose }) => {
 
             <ModelSelector
               label="Heavy Thinker"
-              badge={{ cls: 'thinking', icon: '🧠', text: 'Auto-selected for complex reasoning' }}
+              badge={{ cls: 'thinking', icon: '🧠', text: 'Deep Reasoning / Multi-Step' }}
               modelId={heavyThinkerModel}
               setModelId={setHeavyThinkerModel}
               availableModels={availableModels}
               formatPrice={formatPrice}
+              filterFn={heavyFilter}
             />
+
           </div>
 
           {/* Assistant name */}

@@ -5,6 +5,10 @@ import base64
 import wave
 import tempfile
 import time
+import io
+import re
+from pypdf import PdfReader
+
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +20,7 @@ from openai import AsyncOpenAI
 from memory_manager import MemoryManager
 from faster_whisper import WhisperModel
 from ddgs import DDGS
+from duckduckgo_search import DDGS as OldDDGS # Fallback just in case
 
 # Global STT model - initialized once to keep it in VRAM
 # This may take 30-60s on first run to download the model (~3GB)
@@ -332,11 +337,48 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif message['type'] == 'input_text':
                 text_input = message.get('text', '')
-                images_input = message.get('images', [])
-                print(f"DEBUG: Received text input: '{text_input}' with {len(images_input)} images")
-                if text_input.strip() or images_input:
-                    # Echo the text just in case UI didn't naturally log it, but UI should.
-                    await process_llm_response(websocket, session_id, text_input, images_input)
+                raw_attachments = message.get('attachments', [])
+                input_images = message.get('images', []) # Support legacy 'images' key (e.g. from WhatsApp)
+                
+                # Image handling for backward compatibility and specific multimodal routing
+                images_input = list(input_images)
+                processed_context = ""
+
+                for at in raw_attachments:
+
+                    content_type = at.get('type', '').lower()
+                    # More robust image detection: check mime type OR if it's explicitly a "Pasted Image" and looks like base64
+                    if content_type.startswith('image/') or (not content_type and 'image' in at.get('name', '').lower()):
+                        images_input.append(at['data'])
+                    elif content_type == 'application/pdf':
+
+                        try:
+                            pdf_bytes = base64.b64decode(at['data'])
+                            # Use PdfReader with a Stream
+                            reader = PdfReader(io.BytesIO(pdf_bytes))
+                            text = ""
+                            for page in reader.pages:
+                                text += page.extract_text() + "\n"
+                            processed_context += f"\n--- Context from PDF: {at['name']} ---\n{text}\n"
+                        except Exception as e:
+                            processed_context += f"\n[Error extracting text from PDF {at['name']}: {e}]\n"
+                    elif at['type'].startswith('text/'):
+                        try:
+                            text_data = base64.b64decode(at['data']).decode('utf-8')
+                            processed_context += f"\n--- Context from File: {at['name']} ---\n{text_data}\n"
+                        except Exception as e:
+                            processed_context += f"\n[Error reading file {at['name']}: {e}]\n"
+
+                # Prepend attachment context to user text
+                full_user_text = text_input
+                if processed_context:
+                    full_user_text = f"{processed_context}\nUser Request: {text_input}"
+
+                print(f"DEBUG: Received text input with {len(images_input)} images and {len(raw_attachments) - len(images_input)} documents")
+                
+                if full_user_text.strip() or images_input:
+                    await process_llm_response(websocket, session_id, full_user_text, images_input)
+
 
     except Exception:
         # Prune common disconnects silently
@@ -513,6 +555,17 @@ TOOLS = [
                 "required": ["reason"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "take_screenshot",
+            "description": "Take a screenshot of the user's desktop to see what they are looking at. Use this when the user asks you to look at their screen or check their code. Switching to the multimodal model happens automatically upon calling this.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
     }
 ]
 
@@ -560,7 +613,115 @@ async def execute_tool(name: str, arguments: dict) -> str:
     elif name == "switch_to_heavy_thinker":
         reason = arguments.get("reason", "complex reasoning required")
         return f"__SWITCH_HEAVY_THINKER__: {reason}"
+    elif name == "take_screenshot":
+        import tempfile
+        from PIL import ImageGrab, Image
+        import io
+        import subprocess
+        tmp_path = ""
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            # Use a timeout-capable method for every chunk to avoid hangs
+            # We wrap the capture in a shorter internal timeout logic
+            import shutil
+            has_img = False
+
+            def log_vision(msg):
+                with open("debug_vision.log", "a") as f:
+                    f.write(f"[{datetime.now()}] {msg}\n")
+                    f.flush(); os.fsync(f.fileno())
+
+            # 1. Try GNOME Screenshot (Native Wayland/X11 support)
+            if not has_img and shutil.which("gnome-screenshot"):
+                log_vision("Trying gnome-screenshot...")
+                try:
+                    res = subprocess.run(["gnome-screenshot", "-f", tmp_path], capture_output=True, timeout=5)
+                    if res.returncode == 0:
+                        has_img = True
+                        log_vision("gnome-screenshot SUCCESS.")
+                    else:
+                        log_vision(f"gnome-screenshot FAILED: {res.stderr.decode()}")
+                except Exception as e:
+                    log_vision(f"gnome-screenshot error: {e}")
+
+            # 2. Try GNOME D-Bus (Absolute Wayland fallback)
+            if not has_img:
+                log_vision("Trying GNOME D-Bus screenshot...")
+                try:
+                    dbus_cmd = [
+                        "dbus-send", "--session", "--print-reply", "--dest=org.gnome.Shell.Screenshot",
+                        "/org/gnome/Shell/Screenshot", "org.gnome.Shell.Screenshot.Screenshot",
+                        "boolean:false", "boolean:false", f"string:{tmp_path}"
+                    ]
+                    res = subprocess.run(dbus_cmd, capture_output=True, timeout=5)
+                    if res.returncode == 0:
+                        has_img = True
+                        log_vision("D-Bus screenshot SUCCESS.")
+                    else:
+                        log_vision(f"D-Bus screenshot FAILED: {res.stderr.decode()}")
+                except Exception as e:
+                    log_vision(f"D-Bus screenshot error: {e}")
+
+            # 3. Try scrot (X11 fallback)
+            if not has_img and shutil.which("scrot"):
+                log_vision("Trying scrot...")
+                try:
+                    if subprocess.run(["scrot", "-z", tmp_path], capture_output=True, timeout=5).returncode == 0:
+                        has_img = True
+                        log_vision("scrot SUCCESS.")
+                except Exception as e:
+                    log_vision(f"scrot error: {e}")
+
+            # 4. Try Pillow as last resort (Wait... Pillow usually hangs if others fail, but we'll try it if everything else is missing)
+            if not has_img:
+                log_vision("Trying Pillow ImageGrab (last resort)...")
+                try:
+                    from PIL import ImageGrab
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(ImageGrab.grab)
+                        img = future.result(timeout=4)
+                        img = img.convert("RGB")
+                        img.save(tmp_path)
+                        has_img = True
+                        log_vision("Pillow SUCCESS.")
+                except Exception as e:
+                    log_vision(f"Pillow FAILED or timed out: {e}")
+
+            if not has_img:
+                raise Exception("All screenshot methods (gnome-screenshot, dbus, scrot, Pillow) failed.")
+            
+            # Verify if file exists and has content
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                 raise Exception("Produced image file is missing or empty.")
+
+            img = Image.open(tmp_path).convert("RGB")
+            
+            img.thumbnail((1920, 1080))
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=85)
+            img_data = buf.getvalue()
+            
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            
+            print(f"DEBUG: Screenshot captured successfully, size: {len(img_data)} bytes")
+            base64_img = base64.b64encode(img_data).decode('utf-8')
+            return f"__SCREENSHOT__: {base64_img}"
+        except Exception as e:
+            print(f"DEBUG: take_screenshot error: {e}")
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            return f"Error taking screenshot: {str(e)}"
     return f"Unknown tool: {name}"
+
+def is_vision_model(model_name: str) -> bool:
+    """Check if a model name likely supports vision/multimodal input."""
+    vision_keywords = ["gemini", "gpt-4o", "claude-3-5", "claude-3-opus", "pixtral", "llama-3.2-90b-vision", "vision", "flash"]
+    name_lower = model_name.lower()
+    return any(k in name_lower for k in vision_keywords)
+
 
 async def do_get_weather(location: str) -> str:
     """Get weather data from wttr.in with better fallbacks."""
@@ -592,10 +753,17 @@ async def do_web_search(query: str) -> str:
     """Perform a web search using DuckDuckGo (CAPTCHA-FREE)."""
     try:
         results = []
-        # Fast instantiation directly without context manager since it's deprecated in ddgs 9.0+
-        d = DDGS()
-        for r in d.text(query, max_results=5):
-            results.append(f"Title: {r['title']}\nSnippet: {r['body']}\nSource: {r['href']}\n")
+        # Use ddgs 9.12.0+ library directly to avoid rename warnings
+        from ddgs import DDGS
+        with DDGS() as d:
+            # Basic text search
+            for r in d.text(query, max_results=5):
+                results.append(f"Title: {r['title']}\nSnippet: {r['body']}\nSource: {r['href']}\n")
+            
+            # If no text results, try news search as a fallback (often better for brand-new rumors/topics)
+            if not results:
+                for r in d.news(query, max_results=5):
+                    results.append(f"Title: {r['title']}\nDate: {r.get('date','n/a')}\nSnippet: {r['body']}\nSource: {r['url']}\n")
         
         if results:
             return json.dumps({"status": "success", "results": results})
@@ -638,19 +806,77 @@ async def process_llm_response(websocket: WebSocket, session_id: str, user_text:
         await _process_llm_response_locked(websocket, session_id, user_text, images)
 
 async def _process_llm_response_locked(websocket: WebSocket, session_id: str, user_text: str, images: list = None):
+    if images is None:
+        images = []
     settings = load_settings()
     api_key = settings.get("api_key")
     main_model = settings.get("model", "google/gemma-2-9b-it:free")
     multimodal_model = settings.get("multimodal_model", "google/gemini-1.5-flash")
+    
+    # Sanitize multimodal model ID (e.g. if user has a typo)
+    if "gemini-2.5" in multimodal_model or "flash-1.5" in multimodal_model:
+        # Verified verified best stable multimodal ID for OpenRouter from list
+        multimodal_model = "google/gemini-2.0-flash-001"
+        print(f"DEBUG: Sanity checking multimodal_model ID -> falling back to {multimodal_model}")
+        
     heavy_thinker_model = settings.get("heavy_thinker_model", "google/gemini-pro-1.5")
 
+    # Proactive Vision Detection & Tool Execution:
+    # We take a desktop screenshot ONLY if the user explicitly asks for one (e.g. "screenshot"),
+    # or if they use "soft" vision words (e.g. "look at this") AND haven't already provided an image.
+    explicit_screenshot_words = ["screenshot", "screen capture", "capture my screen", "print screen"]
+    soft_vision_words = ["look at", "see my", "working on", "describe", "see here", "look here"]
+    
+    vision_trigger = False
+    lower_text = user_text.lower()
+    
+    if any(w in lower_text for w in explicit_screenshot_words):
+        vision_trigger = True
+    elif any(w in lower_text for w in soft_vision_words):
+        # Only take a redundant desktop screenshot if no images were already provided (uploaded/pasted)
+        if not images or len(images) == 0:
+            vision_trigger = True
+
+    
+    with open("debug_vision.log", "a") as f:
+        f.write(f"\n[{datetime.now()}] [SESSION {session_id}] vision_trigger: {vision_trigger}, user_text: {user_text[:50]}\n")
+        f.flush(); os.fsync(f.fileno())
+
+    # Pre-capture logic for lightning-fast response
+    pre_captured_image = None
+    if vision_trigger:
+        with open("debug_vision.log", "a") as f: 
+            f.write(f"[{datetime.now()}] Attempting proactive capture...\n")
+            f.flush(); os.fsync(f.fileno())
+            
+        tool_res = await execute_tool("take_screenshot", {})
+        if tool_res.startswith("__SCREENSHOT__"):
+            pre_captured_image = tool_res.replace("__SCREENSHOT__: ", "")
+            images.append(pre_captured_image) # Add to images for the loop below
+            with open("debug_vision.log", "a") as f: 
+                f.write(f"[{datetime.now()}] SUCCESS: Captured {len(pre_captured_image)} bytes\n")
+                f.flush(); os.fsync(f.fileno())
+        else:
+            with open("debug_vision.log", "a") as f: 
+                f.write(f"[{datetime.now()}] FAILURE: {tool_res}\n")
+                f.flush(); os.fsync(f.fileno())
+
     # Dynamic model selection
-    if images:
-        selected_model = multimodal_model
-        print(f"DEBUG: Switching to multimodal model: {selected_model}")
-        await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "multimodal"}, session_id=session_id)
+    if images or vision_trigger:
+        if not is_vision_model(main_model):
+            selected_model = multimodal_model
+            reason = "multimodal_trigger" if vision_trigger else "images"
+            print(f"DEBUG: Switch to multimodal model ({reason}): {selected_model}")
+            await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "multimodal"}, session_id=session_id)
+        else:
+            selected_model = main_model
+            print(f"DEBUG: Vision requested, but main model {main_model} already handles vision.")
+            await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "multimodal"}, session_id=session_id)
     else:
         selected_model = main_model
+        # CRITICAL FIX: Always tell the UI which model we are using, even if it's the main one
+        print(f"DEBUG: Using main model: {selected_model}")
+        await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "text"}, session_id=session_id)
 
     if not api_key:
         await websocket.send_json({
@@ -772,7 +998,8 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
     
     try:
         # Agentic loop: keep calling the LLM until it stops requesting tools
-        max_iterations = 5
+        max_iterations = 8
+        history_tool_calls = [] # Track calls to detect loops
         for iteration in range(max_iterations):
             # Retry loop for rate limits
             for attempt in range(3):
@@ -801,6 +1028,9 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
                     else:
                         raise
             
+            if not response or not hasattr(response, "choices") or not response.choices:
+                raise Exception("LLM returned an empty or invalid response.")
+            
             choice = response.choices[0]
             
             # If the model wants to call tools
@@ -828,17 +1058,27 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
                     "type": "response.ai_text.delta",
                     "delta": "💭 Thinking...\n\n"
                 }, session_id=session_id)
-                
-                # Execute each tool call
+                            # Execute each tool call
+                screenshot_data = None
                 for tool_call in (choice.message.tool_calls or []):
                     fn_name = tool_call.function.name
-                    fn_args = json.loads(tool_call.function.arguments)
+                    fn_args = tool_call.function.arguments
+                    tool_signature = f"{fn_name}:{fn_args}"
                     
-                    print(f"DEBUG: LLM requested tool {fn_name} args {fn_args}")
-                    
-
-                    
-                    result = await execute_tool(fn_name, fn_args)
+                    # Loop detection: if we've already done this EXACT thing twice this turn, error out to break the loop
+                    if history_tool_calls.count(tool_signature) >= 2:
+                        print(f"DEBUG: Loop detected for {tool_signature}. Breaking.")
+                        result = "Error: You are stuck in a loop calling this tool with the same input. Please try a different approach or conclude based on what you have."
+                    else:
+                        history_tool_calls.append(tool_signature)
+                        try:
+                            fn_args_dict = json.loads(fn_args)
+                            print(f"DEBUG: Iteration {iteration} | LLM requested tool {fn_name} with args {fn_args_dict}")
+                            result = await execute_tool(fn_name, fn_args_dict)
+                            print(f"DEBUG: Tool {fn_name} returned {len(str(result))} bytes")
+                        except Exception as tool_err:
+                            print(f"DEBUG: Error executing tool {fn_name}: {tool_err}")
+                            result = f"Error executing tool: {str(tool_err)}"
 
                     # Detect heavy thinker signal and switch model for subsequent calls
                     if isinstance(result, str) and result.startswith("__SWITCH_HEAVY_THINKER__"):
@@ -847,11 +1087,44 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
                         print(f"DEBUG: Switching to heavy thinker model: {selected_model} ({reason})")
                         await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "heavy_thinker"}, session_id=session_id)
                     
-                    # Gemini/OpenRouter logic: tool result must match tool_call_id
+                    if isinstance(result, str) and result.startswith("__SCREENSHOT__: "):
+                        screenshot_data = result.replace("__SCREENSHOT__: ", "")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": "Screenshot captured successfully. It has been attached to the assistant's context."
+                        })
+                    else:
+                        # Gemini/OpenRouter logic: tool result must match tool_call_id
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": str(result)
+                        })
+
+                # If a screenshot was taken, inject it AFTER all tool results (maintains valid role sequence)
+                if screenshot_data:
+                    if not is_vision_model(selected_model):
+                        selected_model = multimodal_model
+                        print(f"DEBUG: Switching to multimodal model for screenshot: {selected_model}")
+                        await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "screenshot"}, session_id=session_id)
+                    else:
+                        print(f"DEBUG: Screenshot captured, but current model {selected_model} already handles vision.")
+                        # Still broadcast the switch visual so the user knows the AI "saw" it
+                        await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "screenshot"}, session_id=session_id)
+                    
                     messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": str(result)
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Observe the attached screenshot of my desktop to answer. Be concise."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{screenshot_data}"}
+                            }
+                        ]
                     })
                 
                 # Continue loop to process tool results
@@ -886,14 +1159,15 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
             memory.add_message(session_id, "assistant", final_text)
 
             # --- TTS Generation ---
+            with open("debug_vision.log", "a") as f:
+                f.write(f"[{datetime.now()}] TTS Check: tts_model_exists={'tts_model' in globals()}, tts_model_ready={tts_model is not None}, tts_enabled={settings.get('tts_enabled', True)}\n")
+                f.flush(); os.fsync(f.fileno())
+
             if 'tts_model' in globals() and tts_model is not None and final_text and settings.get("tts_enabled", True):
                 try:
                     import re
-                    # Strip emojis and *asterisks* (markdown) for smoother speech reading
-                    clean_for_tts = re.sub(r'[*_#]', '', final_text)
-                    clean_for_tts = re.sub(r':[a-z_]+:', '', clean_for_tts)
-                    # Strip non-ascii simple fallback
-                    clean_for_tts = re.sub(r'[^\x00-\x7F]+', ' ', clean_for_tts).strip()
+                    # SIMPLER TTS CLEANING: allow all characters Kokoro might handle or just keep it minimal
+                    clean_for_tts = final_text.replace("*", "").replace("_", "").strip()
                     
                     if clean_for_tts:
                         print("DEBUG: Generating TTS audio with Kokoro...")
@@ -917,7 +1191,7 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
                                 await broadcast_to_uis({
                                     "type": "response.audio.done",
                                     "audio": base64_audio
-                                }, target_ws=websocket)
+                                }, session_id=session_id)
                         print("DEBUG: TTS Generation complete.")
                 except Exception as tts_err:
                     print(f"Warning: TTS Generation failed: {tts_err}")
@@ -935,9 +1209,16 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         print("LLM Loop Error:", e)
         import traceback
         traceback.print_exc()
+        # Send a more descriptive error to the UI
+        error_type = type(e).__name__
+        error_msg = str(e)
+        if "401" in error_msg: error_msg = "Invalid API Key"
+        elif "400" in error_msg: error_msg = f"Invalid Request / Model ({selected_model})"
+        elif "429" in error_msg: error_msg = "Rate Limited"
+        
         await websocket.send_json({
             "type": "response.ai_text.delta",
-            "delta": f"\n[LLM Error: {str(e)}]"
+            "delta": f"\n\n[⚠️ Assistant Error: {error_type} - {error_msg}]"
         })
         await websocket.send_json({"type": "response.ai_text.done", "text": "Error"})
     
@@ -965,7 +1246,8 @@ async def run_inference(audio_data):
             
             # Use faster-whisper on GPU instead of the buggy C++ binary
             print(f"DEBUG: Running STT on GPU (Whisper)...")
-            segments, info = stt_model.transcribe(temp_path, beam_size=1, language="en")
+            # Increase beam_size to 5 for better accuracy on final commit
+            segments, info = stt_model.transcribe(temp_path, beam_size=5, language="en")
             res = " ".join([s.text for s in segments]).strip()
             
             # Filter common Whisper hallucinations from near-silence
