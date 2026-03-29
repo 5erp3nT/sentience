@@ -1,6 +1,6 @@
 :root {
-  --bg-primary: rgba(22, 22, 22, 0.85); /* transparent black for acrylic effect */
-  --bg-secondary: rgba(45, 45, 45, 0.9);
+  --bg-primary: rgba(12, 12, 12, 0.96); /* deeper dark for premium look */
+  --bg-secondary: rgba(28, 28, 28, 0.95);
   --text-primary: #f0f0f0;
   --text-secondary: #a0a0a0;
   --accent: #00ffcc;
@@ -175,7 +175,7 @@ body {
 
 .input-area-wrapper {
   border-top: 1px solid rgba(255,255,255,0.05);
-  background: rgba(0,0,0,0.25);
+  background: rgba(0, 0, 0, 0.4);
   display: flex;
   flex-direction: column;
 }
@@ -336,7 +336,7 @@ input[type="text"]:focus, textarea:focus {
 }
 
 .settings-modal {
-  background: #1a1a1a;
+  background: #0f0f0f;
   border: 1px solid rgba(255,255,255,0.1);
   border-radius: 12px;
   width: 90%;
@@ -440,7 +440,7 @@ input[type="text"]:focus, textarea:focus {
   position: absolute;
   top: calc(100% + 4px);
   left: 0; right: 0;
-  background: #1e1e1e;
+  background: #121212;
   border: 1px solid rgba(255,255,255,0.15);
   border-radius: 8px;
   box-shadow: 0 10px 30px rgba(0,0,0,0.5);
@@ -590,7 +590,7 @@ input[type="text"]:focus, textarea:focus {
   margin: 12px 0;
   border-radius: 8px;
   overflow: hidden;
-  background: #0d1117;
+  background: #080808;
   border: 1px solid rgba(255,255,255,0.1);
 }
 
@@ -656,7 +656,7 @@ pre::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius:
 
 .message.assistant {
   align-self: flex-start;
-  background: linear-gradient(135deg, rgba(40,40,40,0.8), rgba(60,60,60,0.8));
+  background: linear-gradient(135deg, rgba(30,30,30,0.9), rgba(45,45,45,0.9));
   border: 1px solid rgba(255,255,255,0.1);
   border-bottom-left-radius: 4px;
 }
