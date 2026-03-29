@@ -9,14 +9,14 @@ const ModelSelector = ({ label, badge, modelId, setModelId, availableModels, for
   const searchInputRef = useRef(null);
 
   const filtered = (filterFn
-    ? availableModels.filter(filterFn)
+    ? availableModels.filter(m => filterFn(m) || m.id === modelId)
     : availableModels
   ).filter(m =>
     m.name.toLowerCase().includes(search.toLowerCase()) ||
     m.id.toLowerCase().includes(search.toLowerCase())
   );
 
-  const selectedObj = availableModels.find(m => m.id === modelId) || { name: modelId, id: modelId };
+  const selectedObj = availableModels.find(m => String(m.id) === String(modelId)) || { name: modelId, id: modelId };
 
   useEffect(() => {
     const handleClickOutside = (e) => {
@@ -26,13 +26,36 @@ const ModelSelector = ({ label, badge, modelId, setModelId, availableModels, for
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  const isActive = (m) => String(modelId).toLowerCase().trim() === String(m.id).toLowerCase().trim();
+
+  // Primary Scroll: Callback Ref
+  const activeItemRef = useCallback((node) => {
+    if (!node) return;
+    const scroll = () => {
+      const list = node.closest('.dropdown-list');
+      if (list) {
+        const rect = node.getBoundingClientRect();
+        const containerRect = list.getBoundingClientRect();
+        list.scrollTop = list.scrollTop + (rect.top - containerRect.top) - (list.clientHeight / 2) + (rect.height / 2);
+      }
+    };
+    requestAnimationFrame(() => requestAnimationFrame(scroll));
+    setTimeout(scroll, 100);
+  }, []);
+
+  // Fallback: Force scroll on open
   useEffect(() => {
     if (isOpen) {
       setTimeout(() => searchInputRef.current?.focus(), 30);
+      const timer = setTimeout(() => {
+        const active = dropdownRef.current?.querySelector('.dropdown-item.active');
+        if (active) active.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }, 300);
+      return () => clearTimeout(timer);
     } else {
       setSearch('');
     }
-  }, [isOpen]);
+  }, [isOpen, modelId]);
 
   return (
     <div className="form-group" ref={dropdownRef}>
@@ -66,14 +89,15 @@ const ModelSelector = ({ label, badge, modelId, setModelId, availableModels, for
             {filtered.map(m => (
               <div
                 key={m.id}
-                className={`dropdown-item ${modelId === m.id ? 'active' : ''}`}
+                ref={isActive(m) ? activeItemRef : undefined}
+                className={`dropdown-item ${isActive(m) ? 'active' : ''}`}
                 onClick={() => { setModelId(m.id); setIsOpen(false); }}
               >
                 <div className="item-header">
                   <span className="item-name">{m.name}</span>
                   {parseFloat(m.pricing.prompt) === 0 && <span className="badge free">Free</span>}
                   {m.architecture?.modality?.includes('image') && <span className="badge vision">Vision</span>}
-                  {modelId === m.id && <Check size={14} color="var(--accent)" />}
+                  {isActive(m) && <Check size={14} color="var(--accent)" />}
                 </div>
                 <div className="item-id">{m.id}</div>
                 <div className="item-meta">
