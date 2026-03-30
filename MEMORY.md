@@ -14,3 +14,4 @@ This file stores permanent facts and preferences about the user.
 - User's wife suggested 'a gliding bird' as the answer to the riddle: 'I speak without a mouth and hear without ears. I have no body, but I come alive with wind. What am I?'
 - User's name is David Conis.
 - The phone number for Ryan Konas is +1 (984) 225-5310.
+- User asked about Emma Vigman; no known info.

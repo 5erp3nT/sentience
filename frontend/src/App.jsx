@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Mic, MicOff, Settings as SettingsIcon, Send, MessageSquare, Copy, Check, Paperclip, X, FileText, Image as ImageIcon } from 'lucide-react';
+import { Mic, MicOff, Settings as SettingsIcon, Send, MessageSquare, Copy, Check, Paperclip, X, FileText, Image as ImageIcon, ZoomIn, ZoomOut, Maximize, RotateCcw, Info } from 'lucide-react';
 import useWebSocket, { ReadyState } from 'react-use-websocket';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -38,27 +38,179 @@ const CodeBlock = ({ language, value }) => {
   );
 };
 
-const MessageContent = ({ content }) => {
+const ImageModal = ({ src, onClose }) => {
+  const [scale, setScale] = useState(1);
+  const [position, setPosition] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const containerRef = useRef(null);
+  const imgRef = useRef(null);
+
+  const handleWheel = (e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    const newScale = Math.min(Math.max(scale * delta, 0.5), 10);
+    setScale(newScale);
+  };
+
+  const handleMouseDown = (e) => {
+    if (e.button !== 0) return; // Only left click
+    setIsDragging(true);
+    setDragStart({ x: e.clientX - position.x, y: e.clientY - position.y });
+  };
+
+  const handleMouseMove = (e) => {
+    if (!isDragging) return;
+    setPosition({
+      x: e.clientX - dragStart.x,
+      y: e.clientY - dragStart.y
+    });
+  };
+
+  const handleMouseUp = () => {
+    setIsDragging(false);
+  };
+
+  const resetTransform = (e) => {
+    e.stopPropagation();
+    setScale(1);
+    setPosition({ x: 0, y: 0 });
+  };
+
+  const zoomIn = (e) => {
+    e.stopPropagation();
+    setScale(prev => Math.min(prev * 1.2, 10));
+  };
+
+  const zoomOut = (e) => {
+    e.stopPropagation();
+    setScale(prev => Math.max(prev / 1.2, 0.5));
+  };
+
+  // Close on Escape
+  useEffect(() => {
+    const handleEsc = (e) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleEsc);
+    return () => window.removeEventListener('keydown', handleEsc);
+  }, [onClose]);
+
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      className="prose"
-      components={{
-        code({ node, inline, className, children, ...props }) {
-          const match = /language-(\w+)/.exec(className || '');
-          const language = match ? match[1] : '';
-          return !inline ? (
-            <CodeBlock language={language} value={String(children).replace(/\n$/, '')} />
-          ) : (
-            <code className={className} {...props}>
-              {children}
-            </code>
-          );
-        },
-      }}
-    >
-      {content}
-    </ReactMarkdown>
+    <div className="image-modal-overlay" onClick={onClose}>
+      <div className="image-modal-controls no-drag">
+        <button className="control-btn" onClick={zoomIn} title="Zoom In"><ZoomIn size={20} /></button>
+        <button className="control-btn" onClick={zoomOut} title="Zoom Out"><ZoomOut size={20} /></button>
+        <button className="control-btn" onClick={resetTransform} title="Reset"><RotateCcw size={20} /></button>
+        <div className="control-divider" />
+        <button className="control-btn close" onClick={onClose} title="Close"><X size={20} /></button>
+      </div>
+      
+      <div 
+        className="image-modal-container"
+        onWheel={handleWheel}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        ref={containerRef}
+      >
+        <img
+          ref={imgRef}
+          src={src}
+          alt="Preview"
+          className="modal-image"
+          style={{
+            transform: `translate(${position.x}px, ${position.y}px) scale(${scale})`,
+            transition: isDragging ? 'none' : 'transform 0.1s ease-out',
+            cursor: isDragging ? 'grabbing' : 'grab'
+          }}
+          onClick={(e) => e.stopPropagation()}
+          draggable={false}
+        />
+      </div>
+
+      <div className="image-modal-hint">
+        Use mouse wheel to zoom, drag to pan
+      </div>
+    </div>
+  );
+};
+
+
+const GeneratedImage = ({ image, onImageClick }) => {
+  if (!image) return (
+    <div className="assistant-image-error">
+      <ImageIcon size={20} opacity={0.5} />
+      <span>Missing image data</span>
+    </div>
+  );
+  
+  const data = typeof image === 'string' ? image : image.data;
+
+  if (!data) return (
+    <div className="assistant-image-error">
+      <X size={20} color="#ff4444" />
+      <span>Malformed image payload</span>
+    </div>
+  );
+
+  const src = data.startsWith('http') ? data : `data:image/jpeg;base64,${data}`;
+
+  return (
+    <div className="assistant-image-wrapper">
+      <img 
+        src={src} 
+        alt="AI Generated/Captured" 
+        className="assistant-image"
+        onClick={() => onImageClick(src)}
+      />
+    </div>
+  );
+};
+
+
+const MessageContent = ({ content, images = [], onImageClick }) => {
+  return (
+    <div className="message-content-wrapper">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        className="prose"
+        components={{
+          code({ node, inline, className, children, ...props }) {
+            const match = /language-(\w+)/.exec(className || '');
+            const language = match ? match[1] : '';
+            return !inline ? (
+              <CodeBlock language={language} value={String(children).replace(/\n$/, '')} />
+            ) : (
+              <code className={className} {...props}>
+                {children}
+              </code>
+            );
+          },
+          img({ node, ...props }) {
+            return (
+              <div className="markdown-image-container" onClick={() => onImageClick(props.src)}>
+                <img {...props} className="markdown-image" loading="lazy" />
+              </div>
+            );
+          }
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+      {images.length > 0 && (
+        <div className="assistant-images-grid">
+          {images.map((img, idx) => (
+            <GeneratedImage 
+              key={idx} 
+              image={img} 
+              onImageClick={onImageClick} 
+            />
+          ))}
+        </div>
+      )}
+    </div>
   );
 };
 
@@ -71,7 +223,7 @@ const App = () => {
   const [attachments, setAttachments] = useState([]); // {id, name, type, data, preview}
   const [showSettings, setShowSettings] = useState(false);
   const [currentModel, setCurrentModel] = useState({ id: '', reason: '' });
-
+  const [selectedImage, setSelectedImage] = useState(null);
 
   const audioContextRef = useRef(null);
   const streamRef = useRef(null);
@@ -157,7 +309,19 @@ const App = () => {
       } else if (type === 'response.ai_text.done') {
         const finalContent = text || interimAiText;
         if (finalContent) {
-          setMessages(prev => [...prev, { role: 'assistant', content: finalContent }]);
+          setMessages(prev => {
+            const lastMsg = prev[prev.length - 1];
+            if (lastMsg && lastMsg.role === 'assistant') {
+              // Append content to existing assistant message
+              const updatedLast = {
+                ...lastMsg,
+                content: (lastMsg.content && !lastMsg.content.includes(finalContent)) ? 
+                         `${lastMsg.content}\n\n${finalContent}` : finalContent
+              };
+              return [...prev.slice(0, -1), updatedLast];
+            }
+            return [...prev, { role: 'assistant', content: finalContent }];
+          });
           setInterimAiText('');
         }
       } else if (type === 'control.recording.start') {
@@ -169,6 +333,20 @@ const App = () => {
         if (!isPlayingRef.current) {
           playNextAudio();
         }
+      } else if (type === 'response.image.done') {
+        const imageData = { data: lastJsonMessage.image, prompt: lastJsonMessage.full_prompt };
+        setMessages(prev => {
+          const lastMsg = prev[prev.length - 1];
+          if (lastMsg && lastMsg.role === 'assistant') {
+             const updatedLast = {
+               ...lastMsg,
+               images: [...(lastMsg.images || []), imageData]
+             };
+             return [...prev.slice(0, -1), updatedLast];
+          } else {
+            return [...prev, { role: 'assistant', content: '', images: [imageData] }];
+          }
+        });
       } else if (type === 'response.model_switch') {
         setCurrentModel({ id: lastJsonMessage.model, reason: lastJsonMessage.reason });
       }
@@ -183,7 +361,8 @@ const App = () => {
     const content = textInput.trim();
     setMessages(prev => [...prev, { 
       role: 'user', 
-      content: content || (attachments.length > 0 ? "[Attached Files]" : ""),
+      content: content || (attachments.length > 0 ? "" : ""),
+      images: attachments.filter(a => a.type.startsWith('image/')).map(a => a.data),
       attachments: attachments.map(a => ({ name: a.name, type: a.type })) // Just for UI record
     }]);
 
@@ -370,7 +549,11 @@ const App = () => {
         
         {messages.map((msg, i) => (
           <div key={i} className={`message ${msg.role}`}>
-            <MessageContent content={msg.content} />
+            <MessageContent 
+              content={msg.content} 
+              images={msg.images} 
+              onImageClick={(src) => setSelectedImage(src)}
+            />
           </div>
         ))}
         
@@ -382,7 +565,10 @@ const App = () => {
         
         {interimAiText && (
           <div className="message assistant interim">
-            <MessageContent content={interimAiText} />
+            <MessageContent 
+              content={interimAiText} 
+              onImageClick={(src) => setSelectedImage(src)}
+            />
           </div>
         )}
         <div ref={messagesEndRef} />
@@ -460,6 +646,12 @@ const App = () => {
         </div>
       </div>
 
+      {selectedImage && (
+        <ImageModal 
+          src={selectedImage} 
+          onClose={() => setSelectedImage(null)} 
+        />
+      )}
     </div>
   );
 };

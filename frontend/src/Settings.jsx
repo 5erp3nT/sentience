@@ -123,7 +123,12 @@ const Settings = ({ onClose }) => {
   const [model, setModel] = useState('google/gemma-2-9b-it:free');
   const [multimodalModel, setMultimodalModel] = useState('google/gemini-1.5-flash');
   const [heavyThinkerModel, setHeavyThinkerModel] = useState('google/gemini-pro-1.5');
+  const [ttsModel, setTtsModel] = useState('kokoro');
+  const [kokoroVoice, setKokoroVoice] = useState('af_bella');
+  const [chatterboxVoice, setChatterboxVoice] = useState('default');
   const [assistantName, setAssistantName] = useState('Antigravity');
+
+
   const [systemPrompt, setSystemPrompt] = useState("You are a helpful and concise AI assistant living in the user's Linux status bar.");
   const [availableModels, setAvailableModels] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -136,7 +141,12 @@ const Settings = ({ onClose }) => {
         setModel(data.model || 'google/gemma-2-9b-it:free');
         setMultimodalModel(data.multimodal_model || 'google/gemini-1.5-flash');
         setHeavyThinkerModel(data.heavy_thinker_model || 'google/gemini-pro-1.5');
+        setTtsModel(data.tts_model || 'kokoro');
+        setKokoroVoice(data.kokoro_voice || 'af_bella');
+        setChatterboxVoice(data.chatterbox_voice || 'default');
         setAssistantName(data.assistant_name || 'Antigravity');
+
+
         setSystemPrompt(data.system_prompt || "You are a helpful and concise AI assistant living in the user's Linux status bar.");
       })
       .catch(console.error);
@@ -169,8 +179,13 @@ const Settings = ({ onClose }) => {
           model,
           multimodal_model: multimodalModel,
           heavy_thinker_model: heavyThinkerModel,
+          tts_model: ttsModel,
+          kokoro_voice: kokoroVoice,
+          chatterbox_voice: chatterboxVoice,
           assistant_name: assistantName,
           system_prompt: systemPrompt,
+
+
         })
       });
       onClose();
@@ -259,6 +274,70 @@ const Settings = ({ onClose }) => {
               formatPrice={formatPrice}
               filterFn={heavyFilter}
             />
+
+            <div className="form-group">
+              <label>
+                Voice Engine (TTS)
+                <span className="badge-inline tools"><Layers size={14} /> Speech Synthesis</span>
+              </label>
+              <div className="tts-selector-wrapper">
+                <select 
+                  value={ttsModel} 
+                  onChange={e => setTtsModel(e.target.value)}
+                  className="custom-select-trigger"
+                  style={{ width: '100%', appearance: 'none', background: 'var(--bg-secondary)', border: '1px solid var(--border)', color: 'var(--text-primary)', padding: '10px 14px', borderRadius: '8px', outline: 'none', cursor: 'pointer' }}
+                >
+                  <option value="kokoro">Kokoro v0.19 (Ultra-Fast / 82M)</option>
+                  <option value="chatterbox">Chatterbox (Zero-Shot / Resemble AI)</option>
+                </select>
+                <ChevronDown size={14} className="select-icon-overlay" style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-secondary)' }} />
+              </div>
+            </div>
+
+            {ttsModel === 'kokoro' ? (
+              <div className="form-group slide-in">
+                <label>Kokoro Voice</label>
+                <div className="tts-selector-wrapper">
+                  <select 
+                    value={kokoroVoice} 
+                    onChange={e => setKokoroVoice(e.target.value)}
+                    className="custom-select-trigger"
+                    style={{ width: '100%', appearance: 'none', background: 'var(--bg-secondary)', border: '1px solid var(--border)', color: 'var(--text-primary)', padding: '10px 14px', borderRadius: '8px', outline: 'none', cursor: 'pointer' }}
+                  >
+                    <option value="af_bella">Bella (US-F)</option>
+                    <option value="af_nicole">Nicole (US-F)</option>
+                    <option value="af_sarah">Sarah (US-F)</option>
+                    <option value="am_adam">Adam (US-M)</option>
+                    <option value="am_michael">Michael (US-M)</option>
+                    <option value="bf_alice">Alice (UK-F)</option>
+                    <option value="bf_emma">Emma (UK-F)</option>
+                    <option value="bm_george">George (UK-M)</option>
+                    <option value="bm_lewis">Lewis (UK-M)</option>
+                  </select>
+                  <ChevronDown size={14} className="select-icon-overlay" style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-secondary)' }} />
+                </div>
+              </div>
+            ) : (
+              <div className="form-group slide-in">
+                <label>Chatterbox Voice Presets</label>
+                <div className="tts-selector-wrapper">
+                  <select 
+                    value={chatterboxVoice} 
+                    onChange={e => setChatterboxVoice(e.target.value)}
+                    className="custom-select-trigger"
+                    style={{ width: '100%', appearance: 'none', background: 'var(--bg-secondary)', border: '1px solid var(--border)', color: 'var(--text-primary)', padding: '10px 14px', borderRadius: '8px', outline: 'none', cursor: 'pointer' }}
+                  >
+                    <option value="default">Resemble Baseline (conds.pt)</option>
+                    <option value="male_david">David (Deep US-Male)</option>
+                    <option value="female_lj">Linda (Clear US-Female)</option>
+                    <option value="user_cloned">Cloned (Your Voice!)</option>
+                  </select>
+                  <ChevronDown size={14} className="select-icon-overlay" style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-secondary)' }} />
+                </div>
+              </div>
+            )}
+
+
 
           </div>
 

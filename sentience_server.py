@@ -8,6 +8,10 @@ import time
 import io
 import re
 from pypdf import PdfReader
+import torch
+import subprocess
+import signal
+
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
@@ -24,22 +28,219 @@ from duckduckgo_search import DDGS as OldDDGS # Fallback just in case
 
 # Global STT model - initialized once to keep it in VRAM
 # This may take 30-60s on first run to download the model (~3GB)
-print("Loading STT model (Distil-Whisper Large-V3)...")
-# Distil-Whisper fits easily in 8GB VRAM and is extremely fast
-stt_model = WhisperModel("distil-large-v3", device="cuda", compute_type="float16")
-print("STT model loaded and ready on GPU.")
+stt_model = None
 
-print("Loading TTS model (Kokoro v0.19)...")
-try:
-    from kokoro import KPipeline
-    import soundfile as sf
-    import io
-    import re
-    tts_model = KPipeline(lang_code='a') # American English
-    print("TTS model loaded successfully.")
-except Exception as e:
-    print(f"Warning: Failed to load TTS model: {e}")
-    tts_model = None
+def offload_vram_for_task(task_type: str):
+    """
+    Clears VRAM from other model families to prevent OOM.
+    task_type: 'stt', 'tts', or 'sdxl'
+    """
+    global stt_model
+    import gc
+    
+    dirty = False
+    
+    # 1. Offload STT (Whisper) if not the target
+    # Whisper Large takes ~3GB. For 8GB VRAM, we delete it to be safe during SDXL.
+    if task_type != 'stt' and stt_model is not None:
+        print(f"Offloading STT (Whisper) to free VRAM for {task_type}...")
+        stt_model = None # Delete reference
+        dirty = True
+        
+    # 2. Offload TTS models if not the target
+    if task_type != 'tts':
+        for name, model in tts_pipelines.items():
+            if name == "chatterbox":
+                print(f"Moving TTS ({name}) to CPU...")
+                try:
+                    model.t3.to("cpu")
+                    model.s3gen.to("cpu")
+                    model.ve.to("cpu")
+                    if model.conds: model.conds.to("cpu")
+                    torch.cuda.empty_cache()
+                    dirty = True
+                except: pass
+    
+    if dirty:
+        import gc
+        gc.collect()
+        gc.collect() # Double-tap for some PyTorch versions
+        torch.cuda.empty_cache()
+
+def get_stt_model():
+    global stt_model
+    if stt_model is None:
+        offload_vram_for_task('stt')
+        print("Loading STT model (Lazy: Distil-Whisper Large-V3)...")
+        from faster_whisper import WhisperModel
+        stt_model = WhisperModel("distil-large-v3", device="cuda", compute_type="float16")
+        print("STT model loaded and ready.")
+    return stt_model
+
+# TTS model management
+tts_pipelines = {}
+
+def get_tts_pipeline(model_name: str):
+    """
+    Get or load the requested TTS model.
+    To save VRAM, we move unused models to CPU.
+    """
+    # 1. Clear other models to free up VRAM for TTS
+    offload_vram_for_task('tts')
+    
+    # 2. Ensure the requested model is loaded
+    if model_name not in tts_pipelines:
+        if model_name == "kokoro":
+            print("Loading Kokoro TTS (Lazy)...")
+            try:
+                from kokoro import KPipeline
+                # Kokoro is efficient; we'll let it stay where it wants or force CPU first
+                tts_pipelines["kokoro"] = KPipeline(lang_code='a')
+                print("Kokoro TTS ready.")
+            except Exception as e:
+                print(f"Error loading Kokoro: {e}")
+                return None
+        
+        elif model_name == "chatterbox":
+            print("Loading Chatterbox TTS (Lazy)...")
+            try:
+                from chatterbox.tts import ChatterboxTTS
+                # Chatterbox initialization - detect device and load to CPU first to save VRAM
+                model = ChatterboxTTS.from_pretrained(device="cpu")
+                # Ensure it's explicitly on CPU as a lazy baseline
+                model.t3.to("cpu"); model.s3gen.to("cpu"); model.ve.to("cpu")
+                tts_pipelines["chatterbox"] = model
+                print("Chatterbox TTS ready on CPU.")
+            except Exception as e:
+                print(f"Error loading Chatterbox: {e}")
+                return None
+    
+    # 2. Manage VRAM by moving models around
+    requested_model = tts_pipelines.get(model_name)
+    
+    if model_name == "chatterbox" and requested_model:
+        print("Moving Chatterbox to GPU for active use...")
+        try:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            requested_model.device = device
+            requested_model.t3.to(device)
+            requested_model.s3gen.to(device)
+            requested_model.ve.to(device)
+            if requested_model.conds:
+                requested_model.conds.to(device)
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"Failed to move Chatterbox to GPU: {e}")
+    
+    elif model_name == "kokoro":
+        # If we're using Kokoro, offload Chatterbox if it exists
+        if "chatterbox" in tts_pipelines:
+            print("Offloading Chatterbox to CPU to free VRAM...")
+            try:
+                cb = tts_pipelines["chatterbox"]
+                cb.device = "cpu"
+                cb.t3.to("cpu")
+                cb.s3gen.to("cpu")
+                cb.ve.to("cpu")
+                if cb.conds:
+                    cb.conds.to("cpu")
+                torch.cuda.empty_cache()
+            except:
+                pass
+
+    return requested_model
+
+async def generate_tts_base64(text: str) -> str:
+    """Utility to generate TTS audio as a base64 string using the currently configured model."""
+    settings = load_settings()
+    # Explicitly log to a dedicated file since console logs are elusive
+    def log_tts(msg):
+        with open("tts_debug.log", "a") as f:
+            f.write(f"[{datetime.now()}] {msg}\n")
+            f.flush(); os.fsync(f.fileno())
+
+    tts_model_name = settings.get("tts_model", "kokoro")
+    log_tts(f"generate_tts_base64 called with model={tts_model_name}, text_len={len(text)}")
+    active_tts = get_tts_pipeline(tts_model_name)
+    
+    if not active_tts or not text:
+        return None
+        
+    try:
+        import soundfile as sf
+        import numpy as np
+        # SIMPLER TTS CLEANING
+        clean_for_tts = text.replace("*", "").replace("_", "").strip()
+        if not clean_for_tts:
+            return None
+            
+        print(f"DEBUG: Generating internal TTS audio with {tts_model_name}...")
+        audio_chunks = []
+        
+        if tts_model_name == "chatterbox":
+            log_tts(f"Starting Chatterbox inference for text: '{clean_for_tts[:30]}...'")
+            
+            # Map presets to local wav files
+            voice_preset = settings.get("chatterbox_voice", "default")
+            ref_audio_path = None
+            
+            preset_map = {
+                "male_david": "voices/male_us_david.wav",
+                "user_cloned": "voices/user_cloned.wav",
+                "female_lj": "voices/female_us_lj.wav"
+            }
+            
+            if voice_preset in preset_map:
+                candidate = preset_map[voice_preset]
+                if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                    ref_audio_path = candidate
+            
+            log_tts(f"Chatterbox using preset={voice_preset}, ref_path={ref_audio_path}")
+            
+            # If ref_audio_path is None, Chatterbox uses its internal conds.pt (default voice)
+            wav_tensor = active_tts.generate(
+                text=clean_for_tts,
+                audio_prompt_path=ref_audio_path,
+                exaggeration=0.5,
+                cfg_weight=0.5,
+                temperature=0.8
+            )
+            if wav_tensor is not None:
+                sr = active_tts.sr
+                log_tts(f"Chatterbox inference SUCCESS. Shape: {wav_tensor.shape}, SR: {sr}")
+                audio_chunks = [wav_tensor.squeeze(0).detach().cpu().numpy().astype(np.float32)]
+                current_sr = sr
+            else:
+                log_tts("Chatterbox inference returned NONE.")
+                current_sr = 24000
+        else:
+            voice = settings.get("kokoro_voice", "af_bella")
+            generator = active_tts(
+                clean_for_tts, voice=voice,
+                speed=1.0, split_pattern=r'\n+'
+            )
+            for _, _, audio in generator:
+                audio_chunks.append(audio)
+            current_sr = 24000
+        
+        if audio_chunks:
+            combined_audio = np.concatenate(audio_chunks)
+            total_len = len(combined_audio)
+            log_tts(f"Combined audio length: {total_len} samples at {current_sr}Hz")
+            # Clip and write as PCM_16 for maximum browser compatibility
+            combined_audio = np.clip(combined_audio, -1, 1)
+            with io.BytesIO() as wav_io:
+                sf.write(wav_io, combined_audio, current_sr, format='WAV', subtype='PCM_16')
+                b64 = base64.b64encode(wav_io.getvalue()).decode('utf-8')
+                log_tts(f"Encoded audio size: {len(b64)} bytes")
+                return b64
+        else:
+            log_tts("No audio chunks generated.")
+    except Exception as e:
+        print(f"Error in generate_tts_base64: {e}")
+    return None
+
+
     
 
 app = FastAPI()
@@ -56,16 +257,24 @@ app.add_middleware(
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = "settings.json"
 SKILLS_DIR = "skills"
-SETTINGS_FILE = "settings.json"
-SKILLS_DIR = "skills"
+
+active_websockets = set()
+voice_clients = set()
+socket_to_session = {} # websocket -> session_id
+socket_to_client_type = {} # websocket -> client_type
+whatsapp_contacts = {} # jid -> name
+last_session_images = {} # session_id -> list of base64 strings
 
 memory = MemoryManager()
 inference_lock = asyncio.Lock()
-active_websockets = set() # Track for broadcasting triggers
-voice_clients = set() # Track specifically for mic-capable tabs
 primary_voice_client = None # The one that responds to hotkeys
-whatsapp_contacts = {} # Shared state: JID -> {'name': str, 'last_seen': str}
-socket_to_session = {} # WS -> session_id mapping for targeted routing
+@app.get("/last_image")
+async def get_last_image(session_id: str = "default_user"):
+    """Fetch the latest image for a session (used for previews/WhatsApp logic)."""
+    images = last_session_images.get(session_id, [])
+    if not images:
+        return {"error": "No images found for this session"}
+    return {"image_b64": images[-1]}
 
 async def broadcast_to_uis(message, target_ws=None, session_id=None):
     """Send a message to UI clients.
@@ -140,8 +349,13 @@ def load_settings():
         "model": "mistralai/mistral-7b-instruct:free",
         "multimodal_model": "google/gemini-1.5-flash",
         "heavy_thinker_model": "google/gemini-pro-1.5",
+        "tts_model": "kokoro",
+        "kokoro_voice": "af_bella",
+        "chatterbox_voice": "default",
         "assistant_name": "Antigravity",
         "system_prompt": "You are a helpful and concise AI assistant living in the user's Linux status bar."
+
+
     }
 
 def save_settings(settings):
@@ -154,8 +368,14 @@ class SettingsUpdate(BaseModel):
     model: str
     multimodal_model: str = "google/gemini-1.5-flash"
     heavy_thinker_model: str = "google/gemini-pro-1.5"
+    tts_model: str = "kokoro"
+    kokoro_voice: str = "af_bella"
+    chatterbox_voice: str = "default"
     assistant_name: str
     system_prompt: str
+
+
+
 
 
 @app.get("/v1/settings")
@@ -172,8 +392,13 @@ def update_settings(update: SettingsUpdate):
     settings["model"] = update.model
     settings["multimodal_model"] = update.multimodal_model
     settings["heavy_thinker_model"] = update.heavy_thinker_model
+    settings["tts_model"] = update.tts_model
+    settings["kokoro_voice"] = update.kokoro_voice
+    settings["chatterbox_voice"] = update.chatterbox_voice
     settings["assistant_name"] = update.assistant_name
     settings["system_prompt"] = update.system_prompt
+
+
     save_settings(settings)
     return {"status": "ok"}
 
@@ -267,8 +492,9 @@ async def websocket_endpoint(websocket: WebSocket):
     print("Client connected")
     
     audio_buffer = bytearray()
-    last_inference_time = time.time()
-    last_transcript = ""
+    last_active_time = time.time()
+    IDLE_TIMEOUT = 600  # Increased to 10 minutes for better UX
+    is_loading = False
     session_id = "default_user"  # Persistent session across all UI reloads
 
     try:
@@ -284,8 +510,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 # Register this websocket's session for targeted routing
                 socket_to_session[websocket] = session_id
+                client_type = message.get('session', {}).get('client_type', 'ui')
+                socket_to_client_type[websocket] = client_type
                 
-                if message.get('session', {}).get('client_type') == 'voice':
+                if client_type == 'voice':
                     voice_clients.add(websocket)
                     primary_voice_client = websocket
                     print("DEBUG: Primary Voice client connected.")
@@ -333,7 +561,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 # Now pass it to the LLM agent
                 if transcript.strip():
-                    await process_llm_response(websocket, session_id, transcript)
+                    await process_llm_response(websocket, session_id, transcript, is_audio=True)
 
             elif message['type'] == 'input_text':
                 text_input = message.get('text', '')
@@ -377,7 +605,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 print(f"DEBUG: Received text input with {len(images_input)} images and {len(raw_attachments) - len(images_input)} documents")
                 
                 if full_user_text.strip() or images_input:
-                    await process_llm_response(websocket, session_id, full_user_text, images_input)
+                    await process_llm_response(websocket, session_id, full_user_text, images_input, is_audio=False)
 
 
     except Exception:
@@ -522,6 +750,10 @@ TOOLS = [
                     "message": {
                         "type": "string",
                         "description": "The text message to send."
+                    },
+                    "image_b64": {
+                        "type": "string",
+                        "description": "Optional base64 encoded image data to send. Use 'last_screenshot', 'last_image', or 'the_screenshot' to auto-attach the most recent image in the session if you don't have the raw data."
                     }
                 },
                 "required": ["to", "message"]
@@ -566,12 +798,102 @@ TOOLS = [
                 "properties": {}
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": "Generate a creative image or artwork based on a text prompt. The image is displayed AUTOMATICALLY to the user. DO NOT attempt to include markdown image links (e.g. ![...]) in your response, and keep your final confirmation very brief.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "A detailed description of the image to generate (e.g., 'A cyberpunk city with neon lights and flying cars, digital art style')"
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }
     }
 ]
 
-async def execute_tool(name: str, arguments: dict) -> str:
+SDXL_SERVICE_URL = "http://localhost:8346"
+
+async def ensure_sdxl_service(session_id="default_user"):
+    """Ensure the SDXL image generation service is running. Spins it up if needed."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{SDXL_SERVICE_URL}/health", timeout=1.0)
+            if resp.status_code == 200:
+                return True
+    except:
+        pass
+    # 1. CLEAR MAIN PROCESS VRAM TO MAKE ROOM FOR SDXL
+    print("Pre-clearing VRAM for SDXL service startup...")
+    await broadcast_to_uis({
+        "type": "response.ai_text.delta",
+        "delta": "🎨 *Optimizing VRAM for image generation...*\n\n"
+    }, session_id=session_id)
+    offload_vram_for_task('sdxl')
+
+    # 2. CHECK IF PROCESS IS ALREADY RUNNING (EVEN IF NOT HEALTHY YET)
+    # This prevents spawning duplicates during the long model load time
+    try:
+        check = subprocess.run(["pgrep", "-f", "image_gen_service.py"], capture_output=True, text=True)
+        if check.returncode == 0:
+            print(f"SDXL Service process detected (PIDs: {check.stdout.strip()}). Waiting for it to become healthy...")
+        else:
+            print("SDXL Service not detected. Spinning up on-demand...")
+            python_exe = os.path.join(SCRIPT_DIR, ".venv", "bin", "python3")
+            if not os.path.exists(python_exe):
+                python_exe = "python3"
+            
+            # Start the service and log to file
+            log_file = os.path.join(SCRIPT_DIR, "sdxl_service.log")
+            with open(log_file, "a") as f:
+                f.write(f"\n--- Service start: {datetime.now()} ---\n")
+            
+            subprocess.Popen(
+                [python_exe, os.path.join(SCRIPT_DIR, "image_gen_service.py")],
+                stdout=open(log_file, "a"),
+                stderr=subprocess.STDOUT,
+                start_new_session=True 
+            )
+    except Exception as e:
+        print(f"Error starting SDXL service: {e}")
+
+    # 3. Wait for it to become ready
+    print("Waiting for SDXL service to initialize (up to 180s)...")
+    for i in range(180): # Up to 180 seconds for model load
+        await asyncio.sleep(1.0)
+        
+        # Give periodic feedback every 15s
+        if (i + 1) % 15 == 0:
+            await broadcast_to_uis({
+                "type": "response.ai_text.delta",
+                "delta": f"🎨 *Still readying the local generator... ({i+1}/180s)*\n\n"
+            }, session_id=session_id)
+            
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{SDXL_SERVICE_URL}/health", timeout=0.5)
+                if resp.status_code == 200:
+                    print("SDXL Service is now ready.")
+                    await broadcast_to_uis({
+                        "type": "response.ai_text.delta",
+                        "delta": "🎨 *Model loaded! Generating image...*\n\n"
+                    }, session_id=session_id)
+                    return True
+        except:
+            continue
+    
+    print("SDXL service timed out during startup.")
+    return False
+
+async def execute_tool(name: str, arguments: dict, is_audio_input: bool = False, session_id: str = "default") -> str:
     """Execute a tool and return the result as a string."""
-    print(f"DEBUG: Executing tool {name} with args {arguments}")
+    print(f"DEBUG: Executing tool {name} with args {arguments} (Modality: {'Audio' if is_audio_input else 'Text'})")
     if name == "get_weather":
         location = arguments.get("location", "")
         res = await do_get_weather(location)
@@ -601,13 +923,50 @@ async def execute_tool(name: str, arguments: dict) -> str:
     elif name == "send_whatsapp_message":
         to = arguments.get("to", "")
         msg = arguments.get("message", "")
-        # Broadcast to all UIs/Connectors. The WhatsApp connector remains listening.
-        asyncio.create_task(broadcast_to_uis({
+        img_b64 = arguments.get("image_b64", "")
+        
+        # Resolve 'me' to the current session_id if we are coming from a WhatsApp session
+        if to.lower() in ["me", "myself", "self"] and "@" in session_id:
+            print(f"DEBUG: Resolving '{to}' to current session JID: {session_id}")
+            to = session_id
+        
+        # Handle magic strings for referencing recently captured/uploaded images
+        magic_strings = ["last_screenshot", "last_image", "the_screenshot", "screenshot"]
+        if img_b64 and str(img_b64).lower() in magic_strings:
+            cached = last_session_images.get(session_id, [])
+            if cached:
+                img_b64 = cached[-1]
+                print(f"DEBUG: Resolved magic string '{arguments.get('image_b64')}' to cached image ({len(img_b64)} bytes)")
+            else:
+                print(f"DEBUG: Magic string used but no images in cache for session {session_id}")
+                img_b64 = "" # Reset if no cache available
+        
+        payload = {
             "type": "whatsapp.send_message",
             "jid": to,
             "text": msg
-        }))
-        return f"Message sent to {to}."
+        }
+        
+        if img_b64:
+            payload["image"] = img_b64
+        
+        # Parity: if the user's message was audio, always send as audio to WhatsApp too
+        if is_audio_input:
+            print(f"DEBUG: Generating audio payload for WhatsApp message to {to}...")
+            audio_b64 = await generate_tts_base64(msg)
+            if audio_b64:
+                payload["audio"] = audio_b64
+        
+        # Broadcast to all UIs/Connectors. The WhatsApp connector remains listening.
+        print(f"DEBUG: Broadcasting WhatsApp payload to {to} (Has Image: {bool(img_b64)}, Has Audio: {'audio' in payload})")
+        asyncio.create_task(broadcast_to_uis(payload))
+        
+        modality_str = ""
+        if "audio" in payload: modality_str += " (Audio)"
+        if "image" in payload: modality_str += " (Image)"
+        if not modality_str: modality_str = " (Text)"
+        
+        return f"Message sent to {to}{modality_str}."
     elif name == "list_whatsapp_contacts":
         return json.dumps(whatsapp_contacts) if whatsapp_contacts else "No WhatsApp contacts seen yet."
     elif name == "switch_to_heavy_thinker":
@@ -713,7 +1072,66 @@ async def execute_tool(name: str, arguments: dict) -> str:
             print(f"DEBUG: take_screenshot error: {e}")
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
-            return f"Error taking screenshot: {str(e)}"
+    elif name == "generate_image":
+        prompt = arguments.get("prompt", "")
+        if not prompt: return "Error: No prompt provided."
+        
+        # 1. Provide "Thinking..." feedback specifically for image gen
+        await broadcast_to_uis({
+            "type": "response.ai_text.delta",
+            "delta": "🎨 *Creating your masterpiece locally...*\n\n"
+        }, session_id=session_id)
+
+        # 2. Ensure local service is running (on-demand)
+        service_ready = await ensure_sdxl_service(session_id=session_id)
+        
+        image_data = None
+        error_detail = ""
+        if service_ready:
+            print(f"DEBUG: Using local SDXL service for prompt: {prompt}")
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        f"{SDXL_SERVICE_URL}/generate",
+                        json={"prompt": prompt},
+                        timeout=120.0
+                    )
+                    if resp.status_code == 200:
+                         image_data = resp.json().get("image_b64")
+                    else:
+                        error_detail = f"Service Error: {resp.text}"
+                        print(f"DEBUG: Local SDXL service error: {error_detail}")
+            except Exception as e:
+                error_detail = f"Inference Failed: {str(e)}"
+                print(f"DEBUG: Local SDXL connection error: {error_detail}")
+        else:
+            error_detail = "Local generation service failed to start. Check your VRAM usage."
+
+        if image_data:
+            # Broadcast as base64
+            await broadcast_to_uis({
+                "type": "response.image.done",
+                "image": image_data,
+                "full_prompt": prompt,
+                "label": f"Generated Locally: {prompt[:60]}{'...' if len(prompt) > 60 else ''}"
+            }, session_id=session_id)
+            
+            # Cache it so other tools (like WhatsApp) can find it via magic strings
+            if session_id not in last_session_images:
+                last_session_images[session_id] = []
+            last_session_images[session_id].append(image_data)
+            # Keep only last 5 images to save memory
+            if len(last_session_images[session_id]) > 5:
+                last_session_images[session_id].pop(0)
+
+            return f"SUCCESS: The image for '{prompt}' has been displayed locally. Task complete. Do NOT generate again."
+        else:
+            # No cloud fallback - report error to assistant so it can tell the user
+            await broadcast_to_uis({
+                "type": "response.ai_text.delta",
+                "delta": f"❌ *Local Generation Unavailable: {error_detail}*\n\n"
+            }, session_id=session_id)
+            return f"FAILED: {error_detail}. Inform the user that local generation is currently offline."
     return f"Unknown tool: {name}"
 
 def is_vision_model(model_name: str) -> bool:
@@ -801,11 +1219,12 @@ async def do_run_command(command: str) -> str:
 
 llm_lock = asyncio.Lock()
 
-async def process_llm_response(websocket: WebSocket, session_id: str, user_text: str, images: list = None):
+async def process_llm_response(websocket: WebSocket, session_id: str, user_text: str, images: list = None, is_audio: bool = False):
     async with llm_lock:
-        await _process_llm_response_locked(websocket, session_id, user_text, images)
+        await _process_llm_response_locked(websocket, session_id, user_text, images, is_audio=is_audio)
 
-async def _process_llm_response_locked(websocket: WebSocket, session_id: str, user_text: str, images: list = None):
+async def _process_llm_response_locked(websocket: WebSocket, session_id: str, user_text: str, images: list = None, is_audio: bool = False):
+    client_type = socket_to_client_type.get(websocket, "ui")
     if images is None:
         images = []
     settings = load_settings()
@@ -821,14 +1240,12 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         
     heavy_thinker_model = settings.get("heavy_thinker_model", "google/gemini-pro-1.5")
 
-    # Proactive Vision Detection & Tool Execution:
-    # We take a desktop screenshot ONLY if the user explicitly asks for one (e.g. "screenshot"),
-    # or if they use "soft" vision words (e.g. "look at this") AND haven't already provided an image.
-    explicit_screenshot_words = ["screenshot", "screen capture", "capture my screen", "print screen"]
-    soft_vision_words = ["look at", "see my", "working on", "describe", "see here", "look here"]
     
+    # Automatically trigger vision if certain keywords are present
     vision_trigger = False
     lower_text = user_text.lower()
+    explicit_screenshot_words = ["screenshot", "screen shot", "what am i looking at", "take a screenshot", "look at my desk", "look at the screen", "see my screen"]
+    soft_vision_words = ["look at this", "what is this", "check this out", "analyze this"]
     
     if any(w in lower_text for w in explicit_screenshot_words):
         vision_trigger = True
@@ -849,10 +1266,13 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
             f.write(f"[{datetime.now()}] Attempting proactive capture...\n")
             f.flush(); os.fsync(f.fileno())
             
-        tool_res = await execute_tool("take_screenshot", {})
+        tool_res = await execute_tool("take_screenshot", {}, is_audio_input=is_audio, session_id=session_id)
         if tool_res.startswith("__SCREENSHOT__"):
             pre_captured_image = tool_res.replace("__SCREENSHOT__: ", "")
             images.append(pre_captured_image) # Add to images for the loop below
+            # Update cache
+            last_session_images[session_id] = last_session_images.get(session_id, []) + [pre_captured_image]
+            if len(last_session_images[session_id]) > 5: last_session_images[session_id] = last_session_images[session_id][-5:]
             with open("debug_vision.log", "a") as f: 
                 f.write(f"[{datetime.now()}] SUCCESS: Captured {len(pre_captured_image)} bytes\n")
                 f.flush(); os.fsync(f.fileno())
@@ -883,7 +1303,7 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
             "type": "response.ai_text.delta",
             "delta": "[Error: OpenRouter API Key not set. Please configure it in settings.]"
         })
-        await websocket.send_json({"type": "response.ai_text.done", "text": "Error"})
+        await websocket.send_json({"type": "response.ai_text.done", "text": "Error: API Key Missing"})
         return
         
     log_text = user_text
@@ -891,6 +1311,10 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         log_text = "[Image Attached]"
     elif images:
         log_text = f"[Image Attached] {log_text}"
+        
+    # Seed the cache with initial images from the request
+    if images:
+        last_session_images[session_id] = images[-5:] # Keep last 5
         
     # ONLY add to memory if it's not already the latest message in history
     # This avoids duplication between passive logging and interactive turns
@@ -923,7 +1347,8 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
 
     system_prompt = (
         f"You are {assistant_name}, the Sentience assistant. You live in the user's Linux status bar.\n"
-        f"Current Time: {current_time}\n\n"
+        f"Current Time: {current_time}\n"
+        f"Communication Channel: {client_type.upper()}\n\n"
         "IDENTITY & VIBE:\n"
         "- BE CONCISE: Use minimal words. Avoid intros. If the user presents a valid alternative or correction, acknowledge it briefly with logic.\n"
         "- BE AGGRESSIVE: If a tool fails, re-try with the other tool automatically. (e.g., if get_weather fails, use web_search for 'weather in [location]').\n"
@@ -937,10 +1362,13 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         "2. WEATHER: Always try 'get_weather' first. If it fails, IMMEDIATELY use 'web_search' for weather snippets.\n"
         "3. MEMORY: Always use 'record_memory' for personal details. Don't ask, just do it.\n"
         "4. HISTORY: Use 'search_memory' for cross-session context.\n"
-        "5. SUMMARIZE: After using any tool, you MUST provide a concise summary or answer based on the results. NEVER return an empty response after a tool has executed.\n\n"
+        "5. WHATSAPP: Use 'me' or 'myself' as the destination for WhatsApp messages to the current user. To attach an image, use 'last_screenshot', 'last_image', or 'the_screenshot' as the 'image_b64' value.\n"
+        "6. IMAGES: Use 'generate_image' whenever the user asks for a picture, art, or a visual concept. Do not just describe it; create it. The image is shown automatically; DO NOT attempt to include markdown image links (e.g. ![...]).\n"
+        "7. SUMMARIZE: After using any tool, you MUST provide a concise summary or answer based on the results. EXCEPTION: After 'generate_image', you MUST give a 1-sentence confirmation like 'I've generated that for you!' and then **MUST include the full prompt used in a markdown code block** (e.g. ```prompt\n[full prompt]\n```) and then STOP. Never return an empty response.\n\n"
         f"{skills_summary}"
         "GUIDELINES:\n"
-        "- Use DURABLE MEMORY as your core truth."
+        "- Use DURABLE MEMORY as your core truth.\n\n"
+        "(Note: All tools are online. Do not speculate; execute. Task ends immediately after image generation confirmation.)"
     )
     
     if durable_memories:
@@ -960,36 +1388,38 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         role = msg["role"]
         content = msg["content"]
         
-        # If this is the last message and we have active images, transform it into multimodal content
-        if is_last and role == "user" and images:
+        # Pre-process content to avoid malformed data URLs and ensure role alternation
+        if images:
             content_array = []
             if user_text:
                 content_array.append({"type": "text", "text": user_text})
             else:
-                # Fallback to the logged text if user_text is empty
                 content_array.append({"type": "text", "text": content})
                 
-            for img_b64 in images:
+            for img in images:
+                # Guard against double-prefixing base64
+                img_data = img
+                if isinstance(img, str) and img.startswith("data:image"):
+                    img_data = img # Keep as is
+                else:
+                    img_data = f"data:image/jpeg;base64,{img}"
+                    
                 content_array.append({
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                    "image_url": {"url": img_data}
                 })
-            messages.append({"role": "user", "content": content_array})
+            
+            # Avoid duplicate user roles at the end of the chain
+            if not messages or messages[-1]["role"] != "user":
+                messages.append({"role": "user", "content": content_array})
+            else:
+                # If the last message was a user message, just update its content instead of adding a new one
+                messages[-1]["content"] = content_array
         else:
-            messages.append({"role": role, "content": content})
-    
-    # Final check: if history was empty or didn't end with a user role (unlikely), add it now
-    if not any(m["role"] == "user" for m in messages[-2:]):
-        if images:
-            content_array = [{"type": "text", "text": user_text}] if user_text else []
-            for img_b64 in images:
-                content_array.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                })
-            messages.append({"role": "user", "content": content_array})
-        else:
-            messages.append({"role": "user", "content": user_text})
+            if not messages or messages[-1]["role"] != "user":
+                messages.append({"role": "user", "content": user_text})
+            else:
+                messages[-1]["content"] = user_text
 
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -1003,153 +1433,165 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         for iteration in range(max_iterations):
             # Retry loop for rate limits
             for attempt in range(3):
+                # Start streaming response
+                full_content = ""
+                tool_calls = {} # tool_call_id -> {name, arguments}
+                
                 try:
-                    response = await client.chat.completions.create(
+                    stream = await client.chat.completions.create(
                         model=selected_model,
                         messages=messages,
                         tools=TOOLS,
                         tool_choice="auto",
                         temperature=0,
-                        stream=False,  # Revert for stability until loop is refactored
+                        stream=True,
                         extra_headers={
                             "HTTP-Referer": "http://localhost:8345",
                             "X-Title": assistant_name
                         }
                     )
-                    break  # Success
-                except Exception as retry_err:
-                    if "429" in str(retry_err) and attempt < 2:
+                    
+                    async for chunk in stream:
+                        if not chunk or not chunk.choices:
+                            continue
+                        
+                        delta = chunk.choices[0].delta
+                        
+                        # Handle Tool Calls
+                        if delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                idx = tc.index
+                                if idx not in tool_calls:
+                                    tool_calls[idx] = {"id": tc.id, "name": "", "arguments": ""}
+                                if tc.id: tool_calls[idx]["id"] = tc.id
+                                if tc.function:
+                                    if tc.function.name: tool_calls[idx]["name"] += tc.function.name
+                                    if tc.function.arguments: tool_calls[idx]["arguments"] += tc.function.arguments
+                        
+                        # Handle Content
+                        if delta.content:
+                            full_content += delta.content
+                            await broadcast_to_uis({
+                                "type": "response.ai_text.delta",
+                                "delta": delta.content
+                            }, session_id=session_id)
+                    
+                    break # Success, exit retry loop
+                    
+                except Exception as e:
+                    if "429" in str(e) and attempt < 2:
                         wait_time = (attempt + 1) * 3
-                        await websocket.send_json({
-                            "type": "response.text.delta",
-                            "delta": f"⏳ Rate limited, retrying in {wait_time}s...\n"
-                        })
+                        await broadcast_to_uis({"type": "response.ai_text.delta", "delta": f"⏳ Rate limited, retrying in {wait_time}s...\n"}, session_id=session_id)
                         await asyncio.sleep(wait_time)
+                        continue
                     else:
                         raise
-            
-            if not response or not hasattr(response, "choices") or not response.choices:
-                raise Exception("LLM returned an empty or invalid response.")
-            
-            choice = response.choices[0]
-            
-            # If the model wants to call tools
-            if choice.finish_reason == "tool_calls" or (choice.message.tool_calls and len(choice.message.tool_calls) > 0):
-                # Standardize the assistant message as a dictionary for OpenRouter
-                tool_calls_json = []
-                for tc in (choice.message.tool_calls or []):
-                    tool_calls_json.append({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    })
                 
-                messages.append({
-                    "role": "assistant",
-                    "content": choice.message.content or "",
-                    "tool_calls": tool_calls_json
-                })
-                
-                # Show "Thinking..." only to clients in this session
+            # If we reached here, the stream finished
+            if not full_content and not tool_calls:
+                print(f"DEBUG: Empty stream iteration {iteration} for model {selected_model}")
+                break
+            
+            # Standardize the assistant role message (with content and/or tool_calls)
+            assistant_msg = {"role": "assistant", "content": full_content or ""}
+            if tool_calls:
+                tc_list = [tc for tc in tool_calls.values()]
+                assistant_msg["tool_calls"] = [{
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]}
+                } for tc in tc_list]
+            
+            messages.append(assistant_msg)
+            
+            if tool_calls:
+                # Show "Thinking..." feedback
                 await broadcast_to_uis({
                     "type": "response.ai_text.delta",
                     "delta": "💭 Thinking...\n\n"
                 }, session_id=session_id)
-                            # Execute each tool call
+                
+                # Execute each tool call and collect results
                 screenshot_data = None
-                for tool_call in (choice.message.tool_calls or []):
-                    fn_name = tool_call.function.name
-                    fn_args = tool_call.function.arguments
+                for tc in assistant_msg["tool_calls"]:
+                    tool_call_id = tc["id"]
+                    fn_name = tc["function"]["name"]
+                    fn_args = tc["function"]["arguments"]
                     tool_signature = f"{fn_name}:{fn_args}"
                     
-                    # Loop detection: if we've already done this EXACT thing twice this turn, error out to break the loop
+                    # Loop detection
                     if history_tool_calls.count(tool_signature) >= 2:
                         print(f"DEBUG: Loop detected for {tool_signature}. Breaking.")
-                        result = "Error: You are stuck in a loop calling this tool with the same input. Please try a different approach or conclude based on what you have."
+                        result = "Error: You are stuck in a loop calling this tool with the same input."
                     else:
                         history_tool_calls.append(tool_signature)
                         try:
                             fn_args_dict = json.loads(fn_args)
                             print(f"DEBUG: Iteration {iteration} | LLM requested tool {fn_name} with args {fn_args_dict}")
-                            result = await execute_tool(fn_name, fn_args_dict)
+                            result = await execute_tool(fn_name, fn_args_dict, is_audio_input=is_audio, session_id=session_id)
                             print(f"DEBUG: Tool {fn_name} returned {len(str(result))} bytes")
+                            
+                            # Handle screenshot specifically for multimodal context
+                            if isinstance(result, str) and result.startswith("__SCREENSHOT__: "):
+                                screenshot_data = result.replace("__SCREENSHOT__: ", "")
+                                last_session_images[session_id] = last_session_images.get(session_id, []) + [screenshot_data]
+                                if len(last_session_images[session_id]) > 5: last_session_images[session_id] = last_session_images[session_id][-5:]
+                                
+                                # Broadcast to UI
+                                await broadcast_to_uis({
+                                    "type": "response.image.done",
+                                    "image": screenshot_data,
+                                    "label": "Screenshot captured"
+                                }, session_id=session_id)
                         except Exception as tool_err:
                             print(f"DEBUG: Error executing tool {fn_name}: {tool_err}")
                             result = f"Error executing tool: {str(tool_err)}"
 
-                    # Detect heavy thinker signal and switch model for subsequent calls
+                    # Detect heavy thinker switch
                     if isinstance(result, str) and result.startswith("__SWITCH_HEAVY_THINKER__"):
                         selected_model = heavy_thinker_model
-                        reason = result.replace("__SWITCH_HEAVY_THINKER__: ", "")
-                        print(f"DEBUG: Switching to heavy thinker model: {selected_model} ({reason})")
+                        print(f"DEBUG: Switching to heavy thinker model: {selected_model}")
                         await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "heavy_thinker"}, session_id=session_id)
                     
+                    # Append tool result (MUST follow assistant/tool_calls)
                     if isinstance(result, str) and result.startswith("__SCREENSHOT__: "):
-                        screenshot_data = result.replace("__SCREENSHOT__: ", "")
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": "Screenshot captured successfully. It has been attached to the assistant's context."
+                            "tool_call_id": tool_call_id,
+                            "content": "Screenshot captured successfully. It has been attached to context."
                         })
                     else:
-                        # Gemini/OpenRouter logic: tool result must match tool_call_id
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": tool_call.id,
+                            "tool_call_id": tool_call_id,
                             "content": str(result)
                         })
 
-                # If a screenshot was taken, inject it AFTER all tool results (maintains valid role sequence)
+                # Handle screenshot context upgrade (inject as a new USER message which is allowed after a TOOL result)
                 if screenshot_data:
                     if not is_vision_model(selected_model):
                         selected_model = multimodal_model
-                        print(f"DEBUG: Switching to multimodal model for screenshot: {selected_model}")
-                        await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "screenshot"}, session_id=session_id)
-                    else:
-                        print(f"DEBUG: Screenshot captured, but current model {selected_model} already handles vision.")
-                        # Still broadcast the switch visual so the user knows the AI "saw" it
+                        print(f"DEBUG: Upgrading to vision model for screenshot: {selected_model}")
                         await broadcast_to_uis({"type": "response.model_switch", "model": selected_model, "reason": "screenshot"}, session_id=session_id)
                     
                     messages.append({
                         "role": "user",
                         "content": [
-                            {
-                                "type": "text",
-                                "text": "Observe the attached screenshot of my desktop to answer. Be concise."
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{screenshot_data}"}
-                            }
+                            {"type": "text", "text": "New screenshot has been successfully captured. Please analyze this fresh image and respond to my request."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_data}"}}
                         ]
                     })
                 
-                # Continue loop to process tool results
+                print(f"DEBUG: Continuing agent loop iteration {iteration+1}...")
                 continue
             
             # Final text response
-            content = choice.message.content or ""
-            print(f"DEBUG: Raw LLM Response (Iter {iteration}): '{content}'")
-            
-            # Refined LaTeX stripping: only remove if it looks like a Swarrow or specific common LaTeX artifacts
-            import re
-            content = content.replace("$", "")
-            # Only strip specific backslash commands that are known to be problematic, instead of all \words
-            content = re.sub(r'\\(swarrow|text|frac|sqrt|cdot|times|alpha|beta|gamma)', '', content)
-            content = content.replace("\\", "").replace("{}", "")
-            
-            final_text = content.strip()
-            print(f"DEBUG: Clean LLM Response: '{final_text}'")
-            
+            final_text = full_content.strip()
             if not final_text:
                 if iteration == 0:
-                    final_text = "[The model didn't provide an answer or tool call. Try a different model.]"
+                    final_text = "[The model didn't provide an answer or tool call.]"
                 else:
-                    # If we reached here after tool calls and it's still empty, it's a failure to summarize
-                    final_text = "[Error: The model provided tool results but failed to summarize them. Please try again.]"
+                    final_text = "I've completed the requested actions."
             
             await broadcast_to_uis({
                 "type": "response.ai_text.done",
@@ -1158,52 +1600,19 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
             
             memory.add_message(session_id, "assistant", final_text)
 
-            # --- TTS Generation ---
-            with open("debug_vision.log", "a") as f:
-                f.write(f"[{datetime.now()}] TTS Check: tts_model_exists={'tts_model' in globals()}, tts_model_ready={tts_model is not None}, tts_enabled={settings.get('tts_enabled', True)}\n")
-                f.flush(); os.fsync(f.fileno())
-
-            if 'tts_model' in globals() and tts_model is not None and final_text and settings.get("tts_enabled", True):
-                try:
-                    import re
-                    # SIMPLER TTS CLEANING: allow all characters Kokoro might handle or just keep it minimal
-                    clean_for_tts = final_text.replace("*", "").replace("_", "").strip()
-                    
-                    if clean_for_tts:
-                        print("DEBUG: Generating TTS audio with Kokoro...")
-                        # Run generator synchronously since we are at the end of the streaming text flow anyway.
-                        # Using 'af_bella' as a good default female voice
-                        generator = tts_model(
-                            clean_for_tts, voice='af_bella',
-                            speed=1.0, split_pattern=r'\n+'
-                        )
-                        import numpy as np
-                        audio_chunks = []
-                        for _, _, audio in generator:
-                            audio_chunks.append(audio)
-                        
-                        if audio_chunks:
-                            combined_audio = np.concatenate(audio_chunks)
-                            with io.BytesIO() as wav_io:
-                                sf.write(wav_io, combined_audio, 24000, format='WAV')
-                                wav_bytes = wav_io.getvalue()
-                                base64_audio = base64.b64encode(wav_bytes).decode('utf-8')
-                                await broadcast_to_uis({
-                                    "type": "response.audio.done",
-                                    "audio": base64_audio
-                                }, session_id=session_id)
-                        print("DEBUG: TTS Generation complete.")
-                except Exception as tts_err:
-                    print(f"Warning: TTS Generation failed: {tts_err}")
+            if final_text and settings.get("tts_enabled", True):
+                print(f"DEBUG: Generating final assistant response audio...")
+                base64_audio = await generate_tts_base64(final_text)
+                if base64_audio:
+                    await broadcast_to_uis({
+                        "type": "response.audio.done",
+                        "audio": base64_audio
+                    }, session_id=session_id)
 
             return
 
         # Max iterations reached
-        await websocket.send_json({
-            "type": "response.ai_text.delta",
-            "delta": "[Agent loop cap reached]"
-        })
-        await websocket.send_json({"type": "response.ai_text.done", "text": "Error"})
+        await websocket.send_json({"type": "response.ai_text.done", "text": "Error: Agent Loop Cap Reached"})
         
     except Exception as e:
         print("LLM Loop Error:", e)
@@ -1220,7 +1629,7 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
             "type": "response.ai_text.delta",
             "delta": f"\n\n[⚠️ Assistant Error: {error_type} - {error_msg}]"
         })
-        await websocket.send_json({"type": "response.ai_text.done", "text": "Error"})
+        await websocket.send_json({"type": "response.ai_text.done", "text": f"Error: {error_msg if error_msg else 'Internal Failure'}"})
     
 
 async def run_inference(audio_data):
@@ -1247,7 +1656,8 @@ async def run_inference(audio_data):
             # Use faster-whisper on GPU instead of the buggy C++ binary
             print(f"DEBUG: Running STT on GPU (Whisper)...")
             # Increase beam_size to 5 for better accuracy on final commit
-            segments, info = stt_model.transcribe(temp_path, beam_size=5, language="en")
+            model = get_stt_model()
+            segments, info = model.transcribe(temp_path, beam_size=5, language="en")
             res = " ".join([s.text for s in segments]).strip()
             
             # Filter common Whisper hallucinations from near-silence
@@ -1259,41 +1669,6 @@ async def run_inference(audio_data):
                 
             print(f"DEBUG: Inference result: '{res}'")
             return res
-            # (Old logic below removed)
-            process = None # dummy to keep structure for a moment if needed
-            
-            # Old processing removed.
-            return res
-
-        if err:
-            print(f"DEBUG: voxtral stderr: {err}")
-            with open("voxtral_error.log", "a") as f:
-                f.write(f"--- {datetime.now()} ---\n{err}\n")
-
-        lines = output.split('\n')
-        clean_text = ""
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('voxtral_'):
-                continue
-            
-            if line.startswith('[summary]') or line.startswith('[no-transcript]') or line.startswith('[tokens]'):
-                continue
-                
-            # If the line looks like "[timestamp] text", extract the text
-            if line.startswith('[') and ']' in line:
-                parts = line.split(']', 1)
-                if len(parts) > 1:
-                    content = parts[1].strip()
-                    if content:
-                        clean_text += content + " "
-            else:
-                # Fallback: if it doesn't look like a log and doesn't have brackets, it might just be the raw text
-                clean_text += line + " "
-        
-        res = clean_text.strip()
-        print(f"DEBUG: Inference result: '{res}'")
-        return res
         
     except Exception as e:
         print(f"DEBUG: Inference exception: {e}")
