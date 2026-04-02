@@ -497,6 +497,9 @@ const App = () => {
   const textareaRef = useRef(null);
   const isRecordingRequestedRef = useRef(false);
   const recordingTimeoutRef = useRef(null);
+  const playbackAnalyserRef = useRef(null);
+  const playbackDataArrayRef = useRef(null);
+  const playbackAnimationRef = useRef(null);
   const audioAccumulatorRef = useRef([]);
 
 
@@ -514,29 +517,74 @@ const App = () => {
       } catch (e) {}
       currentAudioElementRef.current = null;
     }
+    if (playbackAnimationRef.current) {
+      cancelAnimationFrame(playbackAnimationRef.current);
+      playbackAnimationRef.current = null;
+    }
+    // Final clear amplitude
+    sendJsonMessage({ type: 'client.audio_amplitude', amplitude: 0 });
     isPlayingRef.current = false;
     setIsAiAudioPlaying(false);
+  };
+
+  const broadcastAmplitude = () => {
+    if (!playbackAnalyserRef.current) return;
+    playbackAnalyserRef.current.getByteTimeDomainData(playbackDataArrayRef.current);
+    let sum = 0;
+    for (let i = 0; i < playbackDataArrayRef.current.length; i++) {
+      const val = (playbackDataArrayRef.current[i] - 128) / 128;
+      sum += val * val;
+    }
+    const rms = Math.sqrt(sum / playbackDataArrayRef.current.length);
+    const amp = Math.min(1.0, rms * 15.0); // MASSIVELY increased sensitivity
+    sendJsonMessage({ type: 'client.audio_amplitude', amplitude: amp });
+    playbackAnimationRef.current = requestAnimationFrame(broadcastAmplitude);
   };
 
   const playNextAudio = () => {
     if (audioQueueRef.current.length === 0) {
       isPlayingRef.current = false;
+      setIsAiAudioPlaying(false);
+      if (playbackAnimationRef.current) {
+        cancelAnimationFrame(playbackAnimationRef.current);
+        playbackAnimationRef.current = null;
+      }
+      sendJsonMessage({ type: 'client.audio_amplitude', amplitude: 0 });
       return;
     }
+    
     isPlayingRef.current = true;
     setIsAiAudioPlaying(true);
     const base64Audio = audioQueueRef.current.shift();
     const audio = new window.Audio("data:audio/wav;base64," + base64Audio);
+    
+    if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    
+    if (!playbackAnalyserRef.current) {
+      playbackAnalyserRef.current = audioContextRef.current.createAnalyser();
+      playbackAnalyserRef.current.fftSize = 256;
+      playbackDataArrayRef.current = new Uint8Array(playbackAnalyserRef.current.frequencyBinCount);
+    }
+    
+    const source = audioContextRef.current.createMediaElementSource(audio);
+    source.connect(playbackAnalyserRef.current);
+    playbackAnalyserRef.current.connect(audioContextRef.current.destination);
+    
     currentAudioElementRef.current = audio;
     audio.onended = () => {
-      if (audioQueueRef.current.length === 0) {
-        setIsAiAudioPlaying(false);
-      }
       playNextAudio();
     };
-    audio.play().catch(e => {
-      console.error("Audio playback error:", e);
-      playNextAudio();
+    
+    // Explicitly resume in case of browser-enforced suspension
+    audioContextRef.current.resume().then(() => {
+      audio.play().then(() => {
+        if (!playbackAnimationRef.current) broadcastAmplitude();
+      }).catch(e => {
+        console.error("Audio playback error:", e);
+        playNextAudio();
+      });
     });
   };
 
@@ -958,8 +1006,23 @@ const App = () => {
         <div ref={messagesEndRef} />
         
         {isAiAudioPlaying && (
-          <div className="audio-interrupt-float no-drag">
-            <button className="interrupt-btn premium-glass" onClick={interruptAudio} title="Stop AI Voice">
+          <div className="audio-interrupt-float no-drag" style={{ 
+            position: 'fixed', 
+            bottom: '80px', 
+            left: '50%', 
+            transform: 'translateX(-50%)', 
+            zIndex: 9999,
+            display: 'flex',
+            justifyContent: 'center',
+            width: '100%',
+            pointerEvents: 'none'
+          }}>
+            <button 
+              className="interrupt-btn premium-glass" 
+              onClick={interruptAudio} 
+              title="Stop AI Voice"
+              style={{ pointerEvents: 'auto' }}
+            >
               <div className="stop-square"></div>
               <span>STOP READING</span>
             </button>

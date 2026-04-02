@@ -15,7 +15,8 @@ from pynput import keyboard
 class Communicator(QObject):
     response_received = pyqtSignal(str)
     recording_changed = pyqtSignal(bool)
-    ui_ready = pyqtSignal() # New signal for thread-safe UI enablement
+    amplitude_received = pyqtSignal(float)
+    ui_ready = pyqtSignal()
 
 
 class ResponseModal(QWidget):
@@ -55,6 +56,67 @@ class ResponseModal(QWidget):
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(15000, self.hide)
 
+
+class WaveformWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.X11BypassWindowManagerHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.resize(300, 300)
+        self.amplitude = 0
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update)
+        self.timer.start(16) # 60fps
+        
+        # Position at top center
+        screen = QApplication.primaryScreen().geometry()
+        self.move((screen.width() - self.width()) // 2, 0)
+        self.hide()
+
+    def set_amplitude(self, amp):
+        # Increased sensitivity internally as well
+        self.amplitude = amp
+        if amp > 0.01: 
+            if self.isHidden(): 
+                self.show()
+                self.raise_()
+        else:
+            # Short delay for decay look
+            if amp < 0.005:
+                QTimer.singleShot(800, lambda: self.hide() if self.amplitude < 0.005 else None)
+
+    def paintEvent(self, event):
+        if self.amplitude < 0.01: return
+        
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        center_x = self.width() // 2
+        center_y = self.height() // 2
+        
+        # Draw multiple pulsing rings
+        base_radius = 40
+        rings = 3
+        for i in range(rings):
+            alpha = int(180 * (1 - (i / rings)) * self.amplitude)
+            size = base_radius + (i * 20 * self.amplitude)
+            
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            pen = painter.pen()
+            pen.setColor(QColor(0, 240, 255, alpha))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.drawEllipse(center_x - int(size), center_y - int(size), int(size * 2), int(size * 2))
+        
+        # Center glow
+        glow_size = base_radius + (10 * self.amplitude)
+        painter.setBrush(QBrush(QColor(0, 240, 255, int(100 * self.amplitude))))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(center_x - int(glow_size), center_y - int(glow_size), int(glow_size * 2), int(glow_size * 2))
+        
+        painter.end()
+
 class StatusbarAssistant:
     def __init__(self, app):
         self.app = app
@@ -77,6 +139,8 @@ class StatusbarAssistant:
         
         self.start_backend()
         self.modal = ResponseModal()
+        self.waveform = WaveformWidget()
+        self.communicator.amplitude_received.connect(self.waveform.set_amplitude)
 
         self.tray_icon = QSystemTrayIcon()
         
@@ -367,6 +431,8 @@ class StatusbarAssistant:
                     msg = json.loads(result)
                     if msg.get("type") == "response.ai_text.done":
                         self.communicator.response_received.emit(msg.get("text", ""))
+                    elif msg.get("type") == "response.audio_amplitude":
+                        self.communicator.amplitude_received.emit(float(msg.get("amplitude", 0)))
             except:
                 time.sleep(2.0) # Retry if server not up yet
 

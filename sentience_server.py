@@ -598,6 +598,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 if transcript and transcript.strip():
                     await process_llm_response(websocket, session_id, transcript, is_audio=True)
 
+            elif message['type'] == 'client.audio_amplitude':
+                amplitude = message.get('amplitude', 0)
+                # Broadcast this amplitude to ALL connected clients (especially the Desktop Modals)
+                await broadcast_to_uis({
+                    "type": "response.audio_amplitude",
+                    "amplitude": amplitude
+                }, session_id=session_id)
+
             elif message['type'] == 'input_text':
                 text_input = message.get('text', '')
                 raw_attachments = message.get('attachments', [])
@@ -1424,7 +1432,7 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         "- BE CONCISE: Use minimal words. Avoid intros. If the user presents a valid alternative or correction, acknowledge it briefly with logic.\n"
         "- BE AGGRESSIVE: If a tool fails, re-try with the other tool automatically. (e.g., if get_weather fails, use web_search for 'weather in [location]').\n"
         "- US UNITS: ALWAYS use **Fahrenheit** and **Miles**. Strictly avoid Celsius or Kilometers. This is non-negotiable for the user's region.\n"
-        "- CONCISE WEATHER: Use 'get_weather' for weather/forecast. A rich UI report will be displayed automatically. Just provide a 1-sentence summary and STOP. DO NOT include JSON blocks.\n"
+        "- CONCISE RESEARCH: For news or web searches, aim for ONE comprehensive query. Summarize ALL relevant findings in your response and then STOP. Do not perform follow-up searches unless the initial results are completely irrelevant or empty.\n"
         "- NEVER GIVE UP: Don't speculate. If a tool fails, try an alternative.\n"
         "- NO FILLER: Avoid intros. Just solve the user's request.\n"
         "- MATH: Always use LaTeX with dollar signs (`$...$` or `$$...$$`).\n\n"
@@ -1489,7 +1497,7 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
     
     try:
         # Agentic loop: keep calling the LLM until it stops requesting tools
-        max_iterations = 5
+        max_iterations = 10
         history_tool_calls = [] # Track calls to detect loops
         for iteration in range(max_iterations):
             # Retry loop for rate limits
@@ -1566,10 +1574,10 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
             messages.append(assistant_msg)
             
             if tool_calls:
-                # Show "Thinking..." feedback
+                # Show "Thinking..." feedback with iteration progress
                 await broadcast_to_uis({
                     "type": "response.ai_text.delta",
-                    "delta": "💭 Thinking...\n\n"
+                    "delta": f"💭 Thinking (Step {iteration + 1}/10)...\n\n"
                 }, session_id=session_id)
                 
                 # Execute each tool call and collect results
