@@ -15,3 +15,4 @@ This file stores permanent facts and preferences about the user.
 - User's name is David Conis.
 - The phone number for Ryan Konas is +1 (984) 225-5310.
 - User asked about Emma Vigman; no known info.
+- User wants a good Z-Image Turbo workflow for UI.

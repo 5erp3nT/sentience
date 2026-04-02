@@ -274,16 +274,18 @@ class StatusbarAssistant:
     def on_press(self, key):
         if not self.ui_enabled:
             return
-        self.active_keys.add(key)
         
-        # Check for Alt + \
-        has_alt = any(k in self.active_keys for k in [keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr])
-        has_backslash = False
-        try:
-            k_str = str(key)
-            if (hasattr(key, 'char') and key.char == '\\') or k_str == r"'\\'" or k_str == r"'\''":
-                has_backslash = True
-        except: pass
+        k_str = str(key)
+        self.active_keys.add(k_str)
+        
+        # Robust Alt detection
+        has_alt = any(k in self.active_keys for k in ["Key.alt", "Key.alt_l", "Key.alt_r", "Key.alt_gr"])
+        
+        # Robust Backslash detection
+        has_backslash = (hasattr(key, 'char') and key.char == '\\') or k_str == r"'\\'" or k_str == "Key.backslash"
+        if not has_backslash:
+            # Check existing keys in case this is a repeat event
+            has_backslash = r"'\\'" in self.active_keys or "Key.backslash" in self.active_keys
 
         if has_alt and has_backslash:
             if not self.is_alt_pressed:
@@ -293,15 +295,25 @@ class StatusbarAssistant:
                 threading.Thread(target=self.trigger_backend, args=("start",)).start()
 
     def on_release(self, key):
+        k_str = str(key)
+        # Remove with extra safety for Linux repeat events/modifiers
+        if k_str in self.active_keys:
+            self.active_keys.remove(k_str)
         if key in self.active_keys:
             self.active_keys.remove(key)
             
-        # If we were recording, and the combo is broken, stop
+        # If we were recording, check if the combo is broken
         if self.is_alt_pressed:
-            has_alt = any(k in self.active_keys for k in [keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr])
-            has_backslash = any((hasattr(k, 'char') and k.char == '\\') or (str(k) == r"'\\'") for k in self.active_keys)
+            has_alt = any(k in self.active_keys for k in ["Key.alt", "Key.alt_l", "Key.alt_r", "Key.alt_gr"])
+            has_backslash = r"'\\'" in self.active_keys or "Key.backslash" in self.active_keys
             
-            if not (has_alt and has_backslash):
+            # Additional check: if the key just released IS one of our triggers, stop recording
+            # This handles cases where pynput state might be out of sync
+            is_trigger_release = k_str in ["Key.alt", "Key.alt_l", "Key.alt_r", "Key.alt_gr", r"'\\'", "Key.backslash"]
+            if hasattr(key, 'char') and key.char == '\\':
+                is_trigger_release = True
+
+            if not (has_alt and has_backslash) or is_trigger_release:
                 self.is_alt_pressed = False
                 print("DEBUG: Hotkey Combo Released (STOP)")
                 self.communicator.recording_changed.emit(False)
@@ -416,10 +428,10 @@ class StatusbarAssistant:
         url = "http://localhost:8345"
         try:
             # Try spawning as a native Chrome App window 
-            self.ui_process = subprocess.Popen(["google-chrome", f"--app={url}", "--window-size=400,600"])
+            self.ui_process = subprocess.Popen(["google-chrome", f"--app={url}", "--window-size=1240,1280"])
         except:
             try:
-                self.ui_process = subprocess.Popen(["chromium-browser", f"--app={url}", "--window-size=400,600"])
+                self.ui_process = subprocess.Popen(["chromium-browser", f"--app={url}", "--window-size=1240,1280"])
             except:
                 import webbrowser
                 webbrowser.open(url)

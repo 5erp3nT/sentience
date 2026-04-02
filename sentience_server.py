@@ -11,11 +11,18 @@ from pypdf import PdfReader
 import torch
 import subprocess
 import signal
+import random
+from urllib import parse
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
 
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 import httpx
@@ -40,10 +47,10 @@ def offload_vram_for_task(task_type: str):
     
     dirty = False
     
-    # 1. Offload STT (Whisper) if not the target
-    # Whisper Large takes ~3GB. For 8GB VRAM, we delete it to be safe during SDXL.
-    if task_type != 'stt' and stt_model is not None:
-        print(f"Offloading STT (Whisper) to free VRAM for {task_type}...")
+    # 1. Offload STT (Whisper) only for SDXL to prevent constant reload lag
+    # Whisper takes ~2-3GB. It can usually coexist with TTS in 8GB+ VRAM.
+    if task_type == 'sdxl' and stt_model is not None:
+        print(f"Offloading STT (Whisper) to free maximum VRAM for SDXL...")
         stt_model = None # Delete reference
         dirty = True
         
@@ -69,13 +76,23 @@ def offload_vram_for_task(task_type: str):
 
 def get_stt_model():
     global stt_model
-    if stt_model is None:
-        offload_vram_for_task('stt')
-        print("Loading STT model (Lazy: Distil-Whisper Large-V3)...")
-        from faster_whisper import WhisperModel
-        stt_model = WhisperModel("distil-large-v3", device="cuda", compute_type="float16")
-        print("STT model loaded and ready.")
-    return stt_model
+    try:
+        if stt_model is None:
+            offload_vram_for_task('stt')
+            print("Loading STT model (Lazy: Distil-Whisper Small-EN on CPU)...")
+            from faster_whisper import WhisperModel
+            try:
+                # Still try CPU first to be extremely stable during debug
+                stt_model = WhisperModel("distil-small.en", device="cpu", compute_type="float32")
+                print("STT model loaded on CPU successfully.")
+            except Exception as e2:
+                print(f"Fallback loading failed: {e2}")
+                return None
+        return stt_model
+    except Exception as e:
+        print(f"CRITICAL ERROR in get_stt_model: {e}")
+        stt_model = None
+        return None
 
 # TTS model management
 tts_pipelines = {}
@@ -253,6 +270,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount image cache for direct browser access
+if not os.path.exists("cache/images"):
+    os.makedirs("cache/images")
+app.mount("/cache/images", StaticFiles(directory="cache/images"), name="images")
+
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = "settings.json"
@@ -268,6 +290,16 @@ last_session_images = {} # session_id -> list of base64 strings
 memory = MemoryManager()
 inference_lock = asyncio.Lock()
 primary_voice_client = None # The one that responds to hotkeys
+@app.get("/api/images/cache")
+async def get_image_cache(limit: int = 50):
+    """Fetch metadata for images in the persistent cache."""
+    images = memory.get_all_cached_images(limit=limit)
+    # Convert local paths to accessible URLs
+    for img in images:
+        # e.g. 'cache/images/hash_ts.jpg' -> '/cache/images/hash_ts.jpg'
+        img['url'] = f"/{img['path']}"
+    return images
+
 @app.get("/last_image")
 async def get_last_image(session_id: str = "default_user"):
     """Fetch the latest image for a session (used for previews/WhatsApp logic)."""
@@ -346,6 +378,7 @@ def load_settings():
     # Defaults
     return {
         "api_key": "",
+        "pollinations_key": os.getenv("POLLINATIONS_KEY", ""),
         "model": "mistralai/mistral-7b-instruct:free",
         "multimodal_model": "google/gemini-1.5-flash",
         "heavy_thinker_model": "google/gemini-pro-1.5",
@@ -354,8 +387,6 @@ def load_settings():
         "chatterbox_voice": "default",
         "assistant_name": "Antigravity",
         "system_prompt": "You are a helpful and concise AI assistant living in the user's Linux status bar."
-
-
     }
 
 def save_settings(settings):
@@ -365,6 +396,7 @@ def save_settings(settings):
 
 class SettingsUpdate(BaseModel):
     api_key: str
+    pollinations_key: str = ""
     model: str
     multimodal_model: str = "google/gemini-1.5-flash"
     heavy_thinker_model: str = "google/gemini-pro-1.5"
@@ -389,6 +421,7 @@ def get_settings():
 def update_settings(update: SettingsUpdate):
     settings = load_settings()
     settings["api_key"] = update.api_key
+    settings["pollinations_key"] = update.pollinations_key
     settings["model"] = update.model
     settings["multimodal_model"] = update.multimodal_model
     settings["heavy_thinker_model"] = update.heavy_thinker_model
@@ -443,21 +476,16 @@ global_recording_state = False
 async def trigger_start():
     global global_recording_state
     global_recording_state = True
-    if primary_voice_client:
-        await broadcast_to_uis({"type": "control.recording.start"}, target_ws=primary_voice_client)
-    else:
-        # Fallback to broadcast if no primary identified yet (unlikely)
-        await broadcast_to_uis({"type": "control.recording.start"})
+    print("DEBUG: Global Hotkey -> START RECORDING (Broadcasting to all UIs)")
+    await broadcast_to_uis({"type": "control.recording.start"})
     return {"status": "ok"}
 
 @app.post("/trigger/stop")
 async def trigger_stop():
     global global_recording_state
     global_recording_state = False
-    if primary_voice_client:
-        await broadcast_to_uis({"type": "control.recording.stop"}, target_ws=primary_voice_client)
-    else:
-        await broadcast_to_uis({"type": "control.recording.stop"})
+    print("DEBUG: Global Hotkey -> STOP RECORDING (Broadcasting to all UIs)")
+    await broadcast_to_uis({"type": "control.recording.stop"})
     return {"status": "ok"}
 
 @app.post("/v1/whatsapp/contacts")
@@ -534,33 +562,40 @@ async def websocket_endpoint(websocket: WebSocket):
                 
             elif message['type'] == 'ui.recording.active':
                 # The frontend confirmed it is successfully streaming the mic
+                print("DEBUG: Client recording active - Clearing audio buffer for new turn.")
+                audio_buffer = bytearray()
                 await broadcast_to_uis({"type": "client.recording.started"})
                 
             elif message['type'] == 'input_audio_buffer.append':
                 audio_bytes = base64.b64decode(message['audio'])
                 audio_buffer.extend(audio_bytes)
-                if len(audio_buffer) % 32000 < 2000: # Log every ~1 second of audio
-                    print(f"DEBUG: Received audio packet, current buffer size: {len(audio_buffer)}")
+                print(f"DEBUG: Received audio packet ({len(audio_bytes)} bytes), current buffer size: {len(audio_buffer)}")
                 
-                # Run inference purely for UI interim feedback
-                if len(audio_buffer) > 48000 and (time.time() - last_inference_time) > 1.5:
+                # Run inference purely for UI interim feedback (if on UI client)
+                if client_type == 'ui' and len(audio_buffer) > 48000 and (time.time() - last_inference_time) > 1.5:
                     last_inference_time = time.time()
                     # Run in background to avoid blocking the websocket loop
                     asyncio.create_task(self_inference_task(websocket, audio_buffer[:]))
 
             elif message['type'] == 'input_audio_buffer.commit':
-                print(f"DEBUG: Audio buffer committed, total size: {len(audio_buffer)}")
+                buf_size = len(audio_buffer)
+                print(f"DEBUG: Audio buffer committed. Size: {buf_size} bytes ({buf_size/32000:.2f}s at 16kHz)")
                 # Final transcription inference
+                print("DEBUG: Starting final Whisper inference...")
                 transcript = await run_inference(audio_buffer)
-                await websocket.send_json({
-                    "type": "response.audio_transcript.done",
-                    "text": transcript
-                })
+                if not isinstance(transcript, str): transcript = ""
+                print(f"DEBUG: Final Whisper inference complete. Transcript: '{transcript}'")
+                try:
+                    await websocket.send_json({
+                        "type": "response.audio_transcript.done",
+                        "text": transcript
+                    })
+                except: pass
                 audio_buffer = bytearray()
                 last_transcript = ""
                 
                 # Now pass it to the LLM agent
-                if transcript.strip():
+                if transcript and transcript.strip():
                     await process_llm_response(websocket, session_id, transcript, is_audio=True)
 
             elif message['type'] == 'input_text':
@@ -622,7 +657,7 @@ async def websocket_endpoint(websocket: WebSocket):
 async def self_inference_task(websocket, buffer_snapshot):
     """Helper task to run interim inference without blocking websocket recv."""
     transcript = await run_inference(buffer_snapshot)
-    if transcript.strip():
+    if isinstance(transcript, str) and transcript.strip():
         try:
             await websocket.send_json({
                 "type": "response.audio_transcript.delta",
@@ -815,90 +850,68 @@ TOOLS = [
                 "required": ["prompt"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_cached_images",
+            "description": "Returns a list of titles and IDs for the most recently generated or captured images in the user's permanent cache. Use this when the user asks to see their past images or browse their history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "The maximum number of images to list (default is 10)."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view_cached_image",
+            "description": "Displays a specific image from the persistent cache in the chat window. Requires an image ID obtained from 'list_cached_images'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "description": "The unique numerical ID of the image to display."
+                    }
+                },
+                "required": ["id"]
+            }
+        }
     }
 ]
 
-SDXL_SERVICE_URL = "http://localhost:8346"
+SDXL_SERVICE_URL = "http://127.0.0.1:8346"
 
 async def ensure_sdxl_service(session_id="default_user"):
-    """Ensure the SDXL image generation service is running. Spins it up if needed."""
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{SDXL_SERVICE_URL}/health", timeout=1.0)
-            if resp.status_code == 200:
-                return True
-    except:
-        pass
-    # 1. CLEAR MAIN PROCESS VRAM TO MAKE ROOM FOR SDXL
-    print("Pre-clearing VRAM for SDXL service startup...")
-    await broadcast_to_uis({
-        "type": "response.ai_text.delta",
-        "delta": "🎨 *Optimizing VRAM for image generation...*\n\n"
-    }, session_id=session_id)
-    offload_vram_for_task('sdxl')
-
-    # 2. CHECK IF PROCESS IS ALREADY RUNNING (EVEN IF NOT HEALTHY YET)
-    # This prevents spawning duplicates during the long model load time
-    try:
-        check = subprocess.run(["pgrep", "-f", "image_gen_service.py"], capture_output=True, text=True)
-        if check.returncode == 0:
-            print(f"SDXL Service process detected (PIDs: {check.stdout.strip()}). Waiting for it to become healthy...")
-        else:
-            print("SDXL Service not detected. Spinning up on-demand...")
-            python_exe = os.path.join(SCRIPT_DIR, ".venv", "bin", "python3")
-            if not os.path.exists(python_exe):
-                python_exe = "python3"
-            
-            # Start the service and log to file
-            log_file = os.path.join(SCRIPT_DIR, "sdxl_service.log")
-            with open(log_file, "a") as f:
-                f.write(f"\n--- Service start: {datetime.now()} ---\n")
-            
-            subprocess.Popen(
-                [python_exe, os.path.join(SCRIPT_DIR, "image_gen_service.py")],
-                stdout=open(log_file, "a"),
-                stderr=subprocess.STDOUT,
-                start_new_session=True 
-            )
-    except Exception as e:
-        print(f"Error starting SDXL service: {e}")
-
-    # 3. Wait for it to become ready
-    print("Waiting for SDXL service to initialize (up to 180s)...")
-    for i in range(180): # Up to 180 seconds for model load
-        await asyncio.sleep(1.0)
-        
-        # Give periodic feedback every 15s
-        if (i + 1) % 15 == 0:
-            await broadcast_to_uis({
-                "type": "response.ai_text.delta",
-                "delta": f"🎨 *Still readying the local generator... ({i+1}/180s)*\n\n"
-            }, session_id=session_id)
-            
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(f"{SDXL_SERVICE_URL}/health", timeout=0.5)
-                if resp.status_code == 200:
-                    print("SDXL Service is now ready.")
-                    await broadcast_to_uis({
-                        "type": "response.ai_text.delta",
-                        "delta": "🎨 *Model loaded! Generating image...*\n\n"
-                    }, session_id=session_id)
-                    return True
-        except:
-            continue
-    
-    print("SDXL service timed out during startup.")
-    return False
+    """
+    Pollinations.ai is a cloud service, so we don't need a local service 
+    or to clear VRAM anymore! This is a simple no-op helper for compatibility.
+    """
+    return True
 
 async def execute_tool(name: str, arguments: dict, is_audio_input: bool = False, session_id: str = "default") -> str:
     """Execute a tool and return the result as a string."""
     print(f"DEBUG: Executing tool {name} with args {arguments} (Modality: {'Audio' if is_audio_input else 'Text'})")
     if name == "get_weather":
         location = arguments.get("location", "")
-        res = await do_get_weather(location)
-        print(f"DEBUG: get_weather result: {res}")
-        return res
+        res_str = await do_get_weather(location)
+        try:
+            res_data = json.loads(res_str)
+            if res_data.get("status") == "success" and res_data.get("source") == "wttr.in/v2":
+                print(f"DEBUG: Broadcasting rich weather data for {location}")
+                await broadcast_to_uis({
+                    "type": "response.weather.done",
+                    "weather": res_data
+                }, session_id=session_id)
+        except Exception as e:
+            print(f"DEBUG: Failed to parse weather JSON for broadcast: {e}")
+        return res_str
     elif name == "web_search":
         query = arguments.get("query", "")
         res = await do_web_search(query)
@@ -972,6 +985,25 @@ async def execute_tool(name: str, arguments: dict, is_audio_input: bool = False,
     elif name == "switch_to_heavy_thinker":
         reason = arguments.get("reason", "complex reasoning required")
         return f"__SWITCH_HEAVY_THINKER__: {reason}"
+    elif name == "list_cached_images":
+        limit = arguments.get("limit", 10)
+        images = memory.get_all_cached_images(limit=limit)
+        if not images:
+            return "No images found in cache."
+        
+        summary = f"Found {len(images)} images in cache:\n"
+        for img in images:
+            summary += f"- ID {img['id']}: '{img['prompt']}' (Saved: {img['timestamp']})\n"
+        summary += "\nUse 'view_cached_image' with an ID to display one."
+        return summary
+        
+    elif name == "view_cached_image":
+        img_id = arguments.get("id")
+        if not img_id: return "Error: No image ID provided."
+        b64, prompt = memory.get_cached_image_by_id(img_id)
+        if not b64: return f"Error: Image ID {img_id} not found or file missing."
+        return f"__IMAGE__: {b64}|{prompt or 'Cached Image'}"
+
     elif name == "take_screenshot":
         import tempfile
         from PIL import ImageGrab, Image
@@ -1076,46 +1108,70 @@ async def execute_tool(name: str, arguments: dict, is_audio_input: bool = False,
         prompt = arguments.get("prompt", "")
         if not prompt: return "Error: No prompt provided."
         
-        # 1. Provide "Thinking..." feedback specifically for image gen
+        # 1. Provide initial "Thinking..." feedback
         await broadcast_to_uis({
             "type": "response.ai_text.delta",
-            "delta": "🎨 *Creating your masterpiece locally...*\n\n"
+            "delta": "🎨 *Generating your masterpiece via Pollinations.ai...*\n\n"
         }, session_id=session_id)
 
-        # 2. Ensure local service is running (on-demand)
-        service_ready = await ensure_sdxl_service(session_id=session_id)
-        
+        # 2. Cloud generation - No VRAM clearing required
+        # Pollinations Flux version is fast and high quality
         image_data = None
         error_detail = ""
-        if service_ready:
-            print(f"DEBUG: Using local SDXL service for prompt: {prompt}")
-            try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.post(
-                        f"{SDXL_SERVICE_URL}/generate",
-                        json={"prompt": prompt},
-                        timeout=120.0
-                    )
-                    if resp.status_code == 200:
-                         image_data = resp.json().get("image_b64")
+        
+        try:
+            seed = random.randint(0, 1000000000)
+            
+            # --- HD Prompt Enhancement ---
+            # If the prompt is simple, we enhance it with high-quality tokens
+            enhanced_prompt = prompt
+            quality_tokens = "extremely high detail, photorealistic, 8k, sharp focus, volumetric lighting, masterpiece, super-resolution"
+            if len(prompt.split()) < 20 and quality_tokens not in prompt.lower():
+                enhanced_prompt = f"{prompt}, {quality_tokens}"
+                print(f"DEBUG: Enhancing prompt for quality: {enhanced_prompt}")
+
+            encoded_prompt = parse.quote(enhanced_prompt)
+            # Using the official gen.pollinations.ai endpoint for direct image bytes
+            # Switching model to 'flux' for highest quality as of 2026
+            url = f"https://gen.pollinations.ai/image/{encoded_prompt}?width=1024&height=1024&seed={seed}&model=flux&nologo=true"
+            
+            print(f"DEBUG: Calling Pollinations.ai (Flux) for: {enhanced_prompt}")
+            
+            # Fake some progress milestones to keep the UI feel responsive
+            await broadcast_to_uis({"type": "response.image.progress", "percent": 25, "step": 1, "total": 4}, session_id=session_id)
+            
+            # Use pollinations key from settings if available, fallback to env
+            headers = {}
+            settings = load_settings()
+            p_key = settings.get("pollinations_key") or os.getenv("POLLINATIONS_KEY")
+            if p_key:
+                headers["Authorization"] = f"Bearer {p_key}"
+                print(f"DEBUG: Using Pollinations API Key from settings (starting with {p_key[:5]}...)")
+            
+            async with httpx.AsyncClient() as client:
+                # Pollinations often redirects to CDNs; follow_redirects is CRITICAL
+                resp = await client.get(url, timeout=60.0, headers=headers, follow_redirects=True)
+                
+                await broadcast_to_uis({"type": "response.image.progress", "percent": 75, "step": 3, "total": 4}, session_id=session_id)
+                
+                if resp.status_code == 200:
+                    ct = resp.headers.get("Content-Type", "").lower()
+                    print(f"DEBUG: Pollinations response: {ct} ({len(resp.content)} bytes)")
+                    
+                    if "image" not in ct:
+                        error_detail = f"Received non-image response ({ct}). API might be rate-limited or down."
+                        print(f"DEBUG: Pollinations returned text instead of image: {resp.text[:200]}")
                     else:
-                        error_detail = f"Service Error: {resp.text}"
-                        print(f"DEBUG: Local SDXL service error: {error_detail}")
-            except Exception as e:
-                error_detail = f"Inference Failed: {str(e)}"
-                print(f"DEBUG: Local SDXL connection error: {error_detail}")
-        else:
-            error_detail = "Local generation service failed to start. Check your VRAM usage."
+                        image_data = base64.b64encode(resp.content).decode("utf-8")
+                        await broadcast_to_uis({"type": "response.image.progress", "percent": 100, "step": 4, "total": 4}, session_id=session_id)
+                else:
+                    error_detail = f"Pollinations API returned error code {resp.status_code}"
+        except Exception as e:
+            error_detail = f"Pollinations request failed: {str(e)}"
+            print(f"DEBUG: Pollinations connection error: {error_detail}")
 
         if image_data:
-            # Broadcast as base64
-            await broadcast_to_uis({
-                "type": "response.image.done",
-                "image": image_data,
-                "full_prompt": prompt,
-                "label": f"Generated Locally: {prompt[:60]}{'...' if len(prompt) > 60 else ''}"
-            }, session_id=session_id)
-            
+            print(f"DEBUG: Broadcasting image_data (b64 length: {len(image_data)})")
             # Cache it so other tools (like WhatsApp) can find it via magic strings
             if session_id not in last_session_images:
                 last_session_images[session_id] = []
@@ -1124,14 +1180,14 @@ async def execute_tool(name: str, arguments: dict, is_audio_input: bool = False,
             if len(last_session_images[session_id]) > 5:
                 last_session_images[session_id].pop(0)
 
-            return f"SUCCESS: The image for '{prompt}' has been displayed locally. Task complete. Do NOT generate again."
+            return f"__IMAGE__: {image_data}|{prompt}"
         else:
             # No cloud fallback - report error to assistant so it can tell the user
-            await broadcast_to_uis({
-                "type": "response.ai_text.delta",
-                "delta": f"❌ *Local Generation Unavailable: {error_detail}*\n\n"
-            }, session_id=session_id)
-            return f"FAILED: {error_detail}. Inform the user that local generation is currently offline."
+             await broadcast_to_uis({
+                 "type": "response.ai_text.delta",
+                 "delta": f"❌ *Cloud Generation Unavailable: {error_detail}*\n\n"
+             }, session_id=session_id)
+             return f"FAILED: {error_detail}. Inform the user that cloud generation is currently offline."
     return f"Unknown tool: {name}"
 
 def is_vision_model(model_name: str) -> bool:
@@ -1142,30 +1198,41 @@ def is_vision_model(model_name: str) -> bool:
 
 
 async def do_get_weather(location: str) -> str:
-    """Get weather data from wttr.in with better fallbacks."""
+    """Get rich weather data from wttr.in in JSON format."""
     try:
-        # Strip commas as wttr.in prefers clean city+state format or zip
         clean_loc = location.replace(",", "").strip()
-        # If it looks like US state format but no zip, try to extract first 2 words
         async with httpx.AsyncClient() as client:
-            # Force US Imperial units (?u) for user in NC, and use a richer format
-            url = f"https://wttr.in/{clean_loc.replace(' ', '+')}?u&format=%l:+%C+%t+(Feels+%f)+Wind:%w+Moon:%m+Humidity:%h"
-            resp = await client.get(url, timeout=10.0)
-            if resp.status_code == 200 and "Unknown" not in resp.text:
-                return json.dumps({"status": "success", "result": resp.text.strip(), "source": "wttr.in"})
+            # Use format=j1 for rich structured data
+            url = f"https://wttr.in/{clean_loc.replace(' ', '+')}?format=j1"
+            resp = await client.get(url, timeout=12.0)
             
-            # If failed, try ONLY the Zip if present
-            import re
-            zip_match = re.search(r'\b\d{5}\b', clean_loc)
-            if zip_match:
-                url = f"https://wttr.in/{zip_match.group(0)}?u&format=%l:+%C+%t+(Feels+%f)+Wind:%w+Moon:%m+Humidity:%h"
-                resp = await client.get(url, timeout=8.0)
-                if resp.status_code == 200:
-                    return json.dumps({"status": "success", "result": resp.text.strip(), "source": "wttr.in/zip"})
+            if resp.status_code == 200:
+                data = resp.json()
+                # If wttr.in returns an error page in JSON
+                if not data.get("current_condition"):
+                    return json.dumps({"status": "error", "message": "Location not found or service error."})
+                
+                # Extract essential bits for the tool response but keep it structured
+                res = {
+                    "status": "success",
+                    "location": location,
+                    "current": data["current_condition"][0],
+                    "nearest_area": data["nearest_area"][0],
+                    "weather": data["weather"], # 3-day forecast list
+                    "source": "wttr.in/v2"
+                }
+                return json.dumps(res)
             
+            # Simple fallback
+            url_fb = f"https://wttr.in/{clean_loc.replace(' ', '+')}?u&format=%l:+%C+%t+(Feels+%f)+Wind:%w+Moon:%m+Humidity:%h"
+            resp_fb = await client.get(url_fb, timeout=10.0)
+            if resp_fb.status_code == 200:
+                return json.dumps({"status": "success", "result": resp_fb.text.strip(), "source": "wttr.in/fallback"})
+
             return json.dumps({"status": "error", "message": f"Service status {resp.status_code}"})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
+
 
 async def do_web_search(query: str) -> str:
     """Perform a web search using DuckDuckGo (CAPTCHA-FREE)."""
@@ -1317,10 +1384,12 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         last_session_images[session_id] = images[-5:] # Keep last 5
         
     # ONLY add to memory if it's not already the latest message in history
-    # This avoids duplication between passive logging and interactive turns
     recent_check = memory.get_recent_messages(session_id, limit=1)
     if not recent_check or recent_check[0]["content"] != log_text:
-        memory.add_message(session_id, "user", log_text)
+        memory.add_message(session_id, "user", log_text, images=images)
+    
+    # Tracking images for the assistant's turn persistence
+    turn_images = []
     
     # Retrieve relevant history context
     relevant_facts = memory.search_memory(user_text, top_k=5)
@@ -1349,27 +1418,31 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         f"You are {assistant_name}, the Sentience assistant. You live in the user's Linux status bar.\n"
         f"Current Time: {current_time}\n"
         f"Communication Channel: {client_type.upper()}\n\n"
+        "PERSONALITY:\n"
+        f"{base_prompt}\n\n"
         "IDENTITY & VIBE:\n"
         "- BE CONCISE: Use minimal words. Avoid intros. If the user presents a valid alternative or correction, acknowledge it briefly with logic.\n"
         "- BE AGGRESSIVE: If a tool fails, re-try with the other tool automatically. (e.g., if get_weather fails, use web_search for 'weather in [location]').\n"
         "- US UNITS: ALWAYS use **Fahrenheit** and **Miles**. Strictly avoid Celsius or Kilometers. This is non-negotiable for the user's region.\n"
-        "- CONCISE WEATHER: If the user asks for the weather, use 'get_weather' to report the current condition and temperature briefly.\n"
-        "- NEVER GIVE UP: Don't tell the user 'I cannot pull live data'. That's a failure of your agentic logic. Solve it.\n"
-        "- NO FILLER: Avoid useless follow-up questions. Just respond to the user's request.\n"
-        "- NO LATEX: Direct markdown and emojis only.\n\n"
+        "- CONCISE WEATHER: Use 'get_weather' for weather/forecast. A rich UI report will be displayed automatically. Just provide a 1-sentence summary and STOP. DO NOT include JSON blocks.\n"
+        "- NEVER GIVE UP: Don't speculate. If a tool fails, try an alternative.\n"
+        "- NO FILLER: Avoid intros. Just solve the user's request.\n"
+        "- MATH: Always use LaTeX with dollar signs (`$...$` or `$$...$$`).\n\n"
         "MANDATORY TOOL RULES:\n"
-        "1. REAL-TIME: Always use tools for facts. Use 'web_search' for news/current events.\n"
-        "2. WEATHER: Always try 'get_weather' first. If it fails, IMMEDIATELY use 'web_search' for weather snippets.\n"
-        "3. MEMORY: Always use 'record_memory' for personal details. Don't ask, just do it.\n"
-        "4. HISTORY: Use 'search_memory' for cross-session context.\n"
-        "5. WHATSAPP: Use 'me' or 'myself' as the destination for WhatsApp messages to the current user. To attach an image, use 'last_screenshot', 'last_image', or 'the_screenshot' as the 'image_b64' value.\n"
-        "6. IMAGES: Use 'generate_image' whenever the user asks for a picture, art, or a visual concept. Do not just describe it; create it. The image is shown automatically; DO NOT attempt to include markdown image links (e.g. ![...]).\n"
-        "7. SUMMARIZE: After using any tool, you MUST provide a concise summary or answer based on the results. EXCEPTION: After 'generate_image', you MUST give a 1-sentence confirmation like 'I've generated that for you!' and then **MUST include the full prompt used in a markdown code block** (e.g. ```prompt\n[full prompt]\n```) and then STOP. Never return an empty response.\n\n"
+        "1. REAL-TIME: Always use tools for facts, time, or live data.\n"
+        "2. WEATHER: Use 'get_weather' for current/forecast. Direct UI update is handled automatically.\n"
+        "3. MEMORY: 'record_memory' for facts, 'search_memory' for cross-session history.\n"
+        "4. CACHE: 'list_cached_images' for past images, 'view_cached_image' to display them.\n"
+        "5. WHATSAPP: Destination 'me' for current user. Magic strings like 'last_image' for attachments.\n"
+        "6. IMAGES: 'generate_image' for any visual request. Stop after 1-sentence confirmation and ```prompt``` block.\n"
+        "7. SUMMARIZE: Concise summary after every tool. Special blocks (```prompt```, ```weather```) must be used as instructed to trigger rich UI features.\n\n"
         f"{skills_summary}"
         "GUIDELINES:\n"
-        "- Use DURABLE MEMORY as your core truth.\n\n"
-        "(Note: All tools are online. Do not speculate; execute. Task ends immediately after image generation confirmation.)"
+        "- Use DURABLE MEMORY as your truth.\n\n"
+        "(Note: Task ends immediately after generating an image or a weather report. Never loop indefinitely.)"
     )
+
+
     
     if durable_memories:
         system_prompt += f"\n\n--- DURABLE MEMORY ---\n{durable_memories}\n"
@@ -1382,44 +1455,32 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
 
     messages = [{"role": "system", "content": system_prompt}]
     
-    # Process history and handle images
+    # Correctly build the message list from history
     for i, msg in enumerate(recent_messages):
-        is_last = (i == len(recent_messages) - 1)
         role = msg["role"]
         content = msg["content"]
+        is_last = (i == len(recent_messages) - 1)
         
-        # Pre-process content to avoid malformed data URLs and ensure role alternation
-        if images:
+        if is_last and role == "user" and images:
+            # Inject multimodal content for the current active turn
             content_array = []
-            if user_text:
-                content_array.append({"type": "text", "text": user_text})
-            else:
-                content_array.append({"type": "text", "text": content})
-                
+            # Use user_text if available, fallback to content from DB
+            active_text = user_text if user_text else content
+            if active_text:
+                content_array.append({"type": "text", "text": active_text})
+            
             for img in images:
                 # Guard against double-prefixing base64
-                img_data = img
-                if isinstance(img, str) and img.startswith("data:image"):
-                    img_data = img # Keep as is
-                else:
-                    img_data = f"data:image/jpeg;base64,{img}"
-                    
+                img_data = img if isinstance(img, str) and img.startswith("data:image") else f"data:image/jpeg;base64,{img}"
                 content_array.append({
                     "type": "image_url",
                     "image_url": {"url": img_data}
                 })
-            
-            # Avoid duplicate user roles at the end of the chain
-            if not messages or messages[-1]["role"] != "user":
-                messages.append({"role": "user", "content": content_array})
-            else:
-                # If the last message was a user message, just update its content instead of adding a new one
-                messages[-1]["content"] = content_array
+            messages.append({"role": "user", "content": content_array})
         else:
-            if not messages or messages[-1]["role"] != "user":
-                messages.append({"role": "user", "content": user_text})
-            else:
-                messages[-1]["content"] = user_text
+            # Regular text message (History or current text-only prompt)
+            messages.append({"role": role, "content": content})
+
 
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -1428,7 +1489,7 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
     
     try:
         # Agentic loop: keep calling the LLM until it stops requesting tools
-        max_iterations = 8
+        max_iterations = 5
         history_tool_calls = [] # Track calls to detect loops
         for iteration in range(max_iterations):
             # Retry loop for rate limits
@@ -1519,10 +1580,10 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
                     fn_args = tc["function"]["arguments"]
                     tool_signature = f"{fn_name}:{fn_args}"
                     
-                    # Loop detection
-                    if history_tool_calls.count(tool_signature) >= 2:
-                        print(f"DEBUG: Loop detected for {tool_signature}. Breaking.")
-                        result = "Error: You are stuck in a loop calling this tool with the same input."
+                    # Loop detection: If signature repeats once, force it to try something else or stop
+                    if history_tool_calls.count(tool_signature) >= 1:
+                        print(f"DEBUG: Repeat detected for {tool_signature}. Blocking second attempt.")
+                        result = "Error: You already called this tool with the same input. Please try a different tool (like web_search) or use DIFFERENT parameters to solve the user's request."
                     else:
                         history_tool_calls.append(tool_signature)
                         try:
@@ -1541,8 +1602,27 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
                                 await broadcast_to_uis({
                                     "type": "response.image.done",
                                     "image": screenshot_data,
+                                    "full_prompt": "Screenshot captured",
                                     "label": "Screenshot captured"
                                 }, session_id=session_id)
+                                
+                                # Add to turn persistence
+                                turn_images.append({"data": screenshot_data, "prompt": "Screenshot captured"})
+                            elif isinstance(result, str) and result.startswith("__IMAGE__: "):
+                                parts = result.replace("__IMAGE__: ", "").split("|", 1)
+                                img_data = parts[0]
+                                img_prompt = parts[1] if len(parts) > 1 else "Cached Image"
+                                
+                                # Broadcast to UI immediately (as a finished image event)
+                                await broadcast_to_uis({
+                                    "type": "response.image.done",
+                                    "image": img_data,
+                                    "full_prompt": img_prompt,
+                                    "label": img_prompt if len(img_prompt) < 60 else f"{img_prompt[:60]}..."
+                                }, session_id=session_id)
+                                
+                                turn_images.append({"data": img_data, "prompt": img_prompt})
+                                result = f"Successfully displayed image for prompt: {img_prompt}"
                         except Exception as tool_err:
                             print(f"DEBUG: Error executing tool {fn_name}: {tool_err}")
                             result = f"Error executing tool: {str(tool_err)}"
@@ -1598,7 +1678,7 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
                 "text": final_text
             }, session_id=session_id)
             
-            memory.add_message(session_id, "assistant", final_text)
+            memory.add_message(session_id, "assistant", final_text, images=turn_images)
 
             if final_text and settings.get("tts_enabled", True):
                 print(f"DEBUG: Generating final assistant response audio...")
@@ -1647,6 +1727,9 @@ async def run_inference(audio_data):
                 wf.setframerate(16000)
                 wf.writeframes(audio_data)
             
+            file_size = os.path.getsize(temp_path)
+            print(f"DEBUG: Wav file created: {temp_path}, Size: {file_size} bytes")
+            
             env = os.environ.copy()
             lib_path = os.path.join(SCRIPT_DIR, "sentience.cpp", "build")
             ggml_lib_path = os.path.join(lib_path, "ggml", "src")
@@ -1657,13 +1740,20 @@ async def run_inference(audio_data):
             print(f"DEBUG: Running STT on GPU (Whisper)...")
             # Increase beam_size to 5 for better accuracy on final commit
             model = get_stt_model()
-            segments, info = model.transcribe(temp_path, beam_size=5, language="en")
-            res = " ".join([s.text for s in segments]).strip()
+            if model is None: return ""
             
-            # Filter common Whisper hallucinations from near-silence
-            # We also ignore very tiny conversational filler if it's the only transcript
-            hallucinations = ["thank you.", "thanks for watching!", "subtitles by", "---", "hello.", "hi.", "hey."]
-            if res.lower() in hallucinations or len(res) <= 1:
+            # RUN IN EXECUTOR TO PREVENT BLOCKING THE FASTAPI EVENT LOOP
+            loop = asyncio.get_event_loop()
+            def transcribe_sync():
+                segments, info = model.transcribe(temp_path, beam_size=5, language="en")
+                return " ".join([s.text for s in segments]).strip()
+                
+            res = await loop.run_in_executor(None, transcribe_sync)
+            
+            # Filter real Whisper hallucinations from near-silence
+            # halluncinations usually look like these common phrases when there is background fuzz
+            hallucinations = ["thanks for watching!", "subtitles by", "---", "thank you very much.", "you're welcome."]
+            if not isinstance(res, str) or res.lower() in hallucinations:
                 print(f"DEBUG: Filtered out noise/hallucination: '{res}'")
                 return ""
                 

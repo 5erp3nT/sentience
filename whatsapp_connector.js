@@ -24,6 +24,7 @@ const ALLOWED_JIDS = [
 let sock;
 let controllerWs;
 let contacts = {};
+let pendingGenerations = {}; // jid -> { messageKey, lastPercent }
 
 // Load contacts from disk
 if (fs.existsSync(CONTACT_FILE)) {
@@ -233,7 +234,7 @@ function handleAIInteraction(jid, input) {
         inactivityTimer = setTimeout(() => {
             console.log(`[WhatsApp Outbound] Closing WS due to inactivity for ${jid}`);
             ws.close();
-        }, 15000);
+        }, 60000);
     };
 
     ws.on('open', async () => {
@@ -284,6 +285,7 @@ function handleAIInteraction(jid, input) {
                     }
                     if (fs.existsSync(tempWav)) {
                         const wavBuf = fs.readFileSync(tempWav);
+                        console.log(`[WhatsApp STT Pipeline] Successfully converted audio: ${wavBuf.length} bytes`);
                         fs.unlinkSync(tempWav);
 
                         ws.send(JSON.stringify({
@@ -306,10 +308,44 @@ function handleAIInteraction(jid, input) {
         resetInactivityTimer();
         const message = JSON.parse(data);
 
-        if (message.type === 'response.ai_text.done') {
+        if (message.type === 'response.image.progress') {
+            const percent = message.percent || 0;
+            const statusText = `🎨 *Sentience Art Laboratory*\n` + 
+                               `━━━━━━━━━━━━━━\n` +
+                               `Status: Generating Artwork...\n` +
+                               `Progress: [${'■'.repeat(Math.floor(percent/10))}${'□'.repeat(10-Math.floor(percent/10))}] ${percent}%\n` +
+                               `━━━━━━━━━━━━━━`;
+            
+            try {
+                if (!pendingGenerations[jid]) {
+                    const sent = await sock.sendMessage(jid, { text: statusText + BOT_TAG });
+                    pendingGenerations[jid] = { key: sent.key, lastPercent: percent };
+                } else if (percent >= (pendingGenerations[jid].lastPercent + 10) || percent === 100) {
+                    await sock.sendMessage(jid, { 
+                        text: statusText + BOT_TAG, 
+                        edit: pendingGenerations[jid].key 
+                    });
+                    pendingGenerations[jid].lastPercent = percent;
+                }
+            } catch (err) {
+                console.error('Failed to update progress on WhatsApp:', err);
+                delete pendingGenerations[jid];
+            }
+        } else if (message.type === 'response.ai_text.done') {
             await sock.sendMessage(jid, { text: message.text + BOT_TAG });
         } else if (message.type === 'response.image.done') {
             console.log(`[WhatsApp Outbound] Sending generated image to ${jid}`);
+            
+            // Clean up progress message
+            if (pendingGenerations[jid]) {
+                try {
+                    await sock.sendMessage(jid, { 
+                        delete: pendingGenerations[jid].key 
+                    });
+                } catch (e) {}
+                delete pendingGenerations[jid];
+            }
+
             try {
                 const imgBuf = Buffer.from(message.image, 'base64');
                 await sock.sendMessage(jid, { 

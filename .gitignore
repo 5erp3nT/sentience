@@ -44,3 +44,8 @@ Thumbs.db
 # Project specific
 sentience-model.gguf
 /tmp/sentience_desktop.lock
+
+# Large directories and models
+models/
+cache/
+sd.cpp/

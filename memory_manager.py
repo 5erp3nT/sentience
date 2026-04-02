@@ -1,7 +1,8 @@
 import sqlite3
 import os
 import chromadb
-import re
+import base64
+import hashlib
 from datetime import datetime
 
 class MemoryManager:
@@ -36,22 +37,73 @@ class MemoryManager:
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS history_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER,
+                image_path TEXT,
+                prompt TEXT,
+                FOREIGN KEY(message_id) REFERENCES history(id)
+            )
+        ''')
         self.conn.commit()
 
-    def add_message(self, session_id, role, content):
+    def add_message(self, session_id, role, content, images=None):
         # 1. Store in SQLite
-        self.conn.execute(
+        cursor = self.conn.execute(
             "INSERT INTO history (session_id, role, content) VALUES (?, ?, ?)",
             (session_id, role, content)
         )
+        msg_id = cursor.lastrowid
+        
+        # 2. Store Images if present
+        if images:
+            image_dir = "cache/images"
+            if not os.path.exists(image_dir):
+                os.makedirs(image_dir)
+                
+            for img in images:
+                # Handle different image formats (raw base64 string or dict with prompt)
+                img_data = img
+                img_prompt = None
+                if isinstance(img, dict):
+                    img_data = img.get("data")
+                    img_prompt = img.get("prompt")
+                
+                if not img_data or not isinstance(img_data, str):
+                    continue
+                
+                # Sanitize: strip metadata prefix if present
+                clean_b64 = img_data
+                if "," in img_data:
+                    clean_b64 = img_data.split(",")[1]
+                
+                # Generate unique filename using hash
+                try:
+                    raw_bytes = base64.b64decode(clean_b64)
+                    img_hash = hashlib.sha256(raw_bytes).hexdigest()
+                    filename = f"{img_hash[:16]}_{int(datetime.now().timestamp())}.jpg"
+                    filepath = os.path.join(image_dir, filename)
+                    
+                    with open(filepath, "wb") as f:
+                        f.write(raw_bytes)
+                    
+                    self.conn.execute(
+                        "INSERT INTO history_images (message_id, image_path, prompt) VALUES (?, ?, ?)",
+                        (msg_id, filepath, img_prompt)
+                    )
+                except Exception as e:
+                    print(f"Error caching image: {e}")
+
         self.conn.commit()
         
-        # 2. Log to Daily File (OpenClaw style)
+        # 3. Log to Daily File (OpenClaw style)
         date_str = datetime.now().strftime("%Y-%m-%d")
         daily_file = os.path.join(self.memory_dir, f"{date_str}.md")
         with open(daily_file, "a") as f:
             time_str = datetime.now().strftime("%H:%M:%S")
-            f.write(f"### [{time_str}] {role.upper()}\n{content}\n\n")
+            img_marker = f" [Images: {len(images)}]" if images else ""
+            f.write(f"### [{time_str}] {role.upper()}{img_marker}\n{content}\n\n")
 
         # 3. Semantic Indexing for user messages
         if role == 'user':
@@ -64,15 +116,41 @@ class MemoryManager:
 
     def get_recent_messages(self, session_id, limit=20):
         cursor = self.conn.execute('''
-            SELECT role, content FROM (
-                SELECT role, content, timestamp, id 
+            SELECT id, role, content FROM (
+                SELECT id, role, content, timestamp 
                 FROM history 
                 WHERE session_id = ? 
                 ORDER BY timestamp DESC, id DESC 
                 LIMIT ?
             ) ORDER BY timestamp ASC, id ASC
         ''', (session_id, limit))
-        return [{"role": row[0], "content": row[1]} for row in cursor.fetchall()]
+        
+        results = []
+        for row in cursor.fetchall():
+            msg_id, role, content = row
+            msg_dict = {"role": role, "content": content}
+            
+            # Fetch associated images
+            img_cursor = self.conn.execute(
+                "SELECT image_path, prompt FROM history_images WHERE message_id = ?",
+                (msg_id,)
+            )
+            images = []
+            for img_row in img_cursor.fetchall():
+                path, prompt = img_row
+                if os.path.exists(path):
+                    try:
+                        with open(path, "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode("utf-8")
+                            images.append({"data": b64, "prompt": prompt})
+                    except Exception as e:
+                        print(f"Error loading cached image {path}: {e}")
+            
+            if images:
+                msg_dict["images"] = images
+            results.append(msg_dict)
+            
+        return results
 
     def get_durable_memories(self):
         """Reads the human-readable MEMORY.md file."""
@@ -99,6 +177,37 @@ class MemoryManager:
             ids=[doc_id]
         )
         return "Added to durable memory."
+
+    def get_all_cached_images(self, limit=10):
+        """Returns metadata for the most recently cached images."""
+        cursor = self.conn.execute('''
+            SELECT hi.id, hi.image_path, hi.prompt, h.timestamp 
+            FROM history_images hi
+            JOIN history h ON hi.message_id = h.id
+            ORDER BY h.timestamp DESC
+            LIMIT ?
+        ''', (limit,))
+        
+        results = []
+        for row in cursor.fetchall():
+            img_id, path, prompt, ts = row
+            results.append({
+                "id": img_id,
+                "path": path,
+                "prompt": prompt or "No prompt recorded",
+                "timestamp": ts
+            })
+        return results
+
+    def get_cached_image_by_id(self, img_id):
+        """Retrieves base64 data and metadata for a specific cached image."""
+        cursor = self.conn.execute("SELECT image_path, prompt FROM history_images WHERE id = ?", (img_id,))
+        row = cursor.fetchone()
+        if row and os.path.exists(row[0]):
+            with open(row[0], "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+                return b64, row[1]
+        return None, None
 
     def search_memory(self, query, top_k=3):
         if not query.strip():

@@ -120,6 +120,7 @@ const ModelSelector = ({ label, badge, modelId, setModelId, availableModels, for
 // ─── Main Settings Panel ──────────────────────────────────────────────────────
 const Settings = ({ onClose }) => {
   const [apiKey, setApiKey] = useState('');
+  const [pollinationsKey, setPollinationsKey] = useState('');
   const [model, setModel] = useState('google/gemma-2-9b-it:free');
   const [multimodalModel, setMultimodalModel] = useState('google/gemini-1.5-flash');
   const [heavyThinkerModel, setHeavyThinkerModel] = useState('google/gemini-pro-1.5');
@@ -138,6 +139,7 @@ const Settings = ({ onClose }) => {
       .then(r => r.json())
       .then(data => {
         setApiKey(data.api_key || '');
+        setPollinationsKey(data.pollinations_key || '');
         setModel(data.model || 'google/gemma-2-9b-it:free');
         setMultimodalModel(data.multimodal_model || 'google/gemini-1.5-flash');
         setHeavyThinkerModel(data.heavy_thinker_model || 'google/gemini-pro-1.5');
@@ -176,6 +178,7 @@ const Settings = ({ onClose }) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           api_key: apiKey,
+          pollinations_key: pollinationsKey,
           model,
           multimodal_model: multimodalModel,
           heavy_thinker_model: heavyThinkerModel,
@@ -235,6 +238,16 @@ const Settings = ({ onClose }) => {
               value={apiKey}
               onChange={e => setApiKey(e.target.value)}
               placeholder="sk-or-v1-..."
+            />
+          </div>
+
+          <div className="form-group">
+            <label>Pollinations.ai API Key (Optional)</label>
+            <input
+              type="password"
+              value={pollinationsKey}
+              onChange={e => setPollinationsKey(e.target.value)}
+              placeholder="Paste your Pollinations key for Flux/ZImage models"
             />
           </div>
 

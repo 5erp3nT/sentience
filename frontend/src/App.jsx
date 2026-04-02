@@ -1,8 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Mic, MicOff, Settings as SettingsIcon, Send, MessageSquare, Copy, Check, Paperclip, X, FileText, Image as ImageIcon, ZoomIn, ZoomOut, Maximize, RotateCcw, Info } from 'lucide-react';
+import { Mic, MicOff, Settings as SettingsIcon, Send, MessageSquare, Copy, Check, Paperclip, X, FileText, Image as ImageIcon, ZoomIn, ZoomOut, Maximize, RotateCcw, Info, ChevronLeft, ChevronRight, Scaling, Square, Sun, Cloud, CloudRain, CloudSnow, CloudLightning, Thermometer, Wind, Droplets, Sunrise, Sunset } from 'lucide-react';
 import useWebSocket, { ReadyState } from 'react-use-websocket';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
+import 'katex/dist/katex.min.css';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import Settings from './Settings';
@@ -38,13 +41,112 @@ const CodeBlock = ({ language, value }) => {
   );
 };
 
-const ImageModal = ({ src, onClose }) => {
+const WeatherWidget = ({ data }) => {
+  if (!data) return null;
+  const { current, location } = data;
+  if (!current) return <div className="weather-error">Invalid weather data</div>;
+
+  const getIcon = (code) => {
+    const c = parseInt(code);
+    if (c === 113) return <Sun className="weather-icon-main sunny" size={48} />;
+    if ([116, 119, 122].includes(c)) return <Cloud className="weather-icon-main cloudy" size={48} />;
+    if ([176, 263, 266, 281, 293, 296, 299, 302, 305, 308, 311, 353, 356, 359].includes(c)) return <CloudRain className="weather-icon-main rainy" size={48} />;
+    if ([200, 386, 389, 392, 395].includes(c)) return <CloudLightning className="weather-icon-main stormy" size={48} />;
+    if ([179, 227, 230, 323, 326, 329, 332, 335, 338, 368, 371].includes(c)) return <CloudSnow className="weather-icon-main snowy" size={48} />;
+    return <Cloud className="weather-icon-main" size={48} />;
+  };
+
+  return (
+    <div className="weather-widget-premium">
+      <div className="weather-glass-card">
+        <div className="weather-top">
+          <div className="weather-loc">
+            <h3>{location || 'Unknown Location'}</h3>
+            <p className="weather-date">{new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}</p>
+          </div>
+          <div className="weather-main-stat">
+            {getIcon(current.weatherCode)}
+            <div className="weather-temp-group">
+              <span className="weather-temp-value">{current.temp_F}°</span>
+              <span className="weather-cond">{current.weatherDesc?.[0]?.value || 'Condition Unknown'}</span>
+            </div>
+          </div>
+        </div>
+        
+        <div className="weather-details-row">
+          <div className="weather-stat-box">
+            <Thermometer size={14} className="stat-icon" />
+            <div className="stat-label">Feels Like</div>
+            <div className="stat-value">{current.FeelsLikeF}°F</div>
+          </div>
+          <div className="weather-stat-box">
+            <Wind size={14} className="stat-icon" />
+            <div className="stat-label">Wind speed</div>
+            <div className="stat-value">{current.windspeedMiles} mph</div>
+          </div>
+          <div className="weather-stat-box">
+            <Droplets size={14} className="stat-icon" />
+            <div className="stat-label">Humidity</div>
+            <div className="stat-value">{current.humidity}%</div>
+          </div>
+        </div>
+
+        {data.weather && data.weather.length > 0 && (
+          <div className="weather-forecast-section">
+            <h4 className="forecast-title">3-Day Forecast</h4>
+            <div className="weather-forecast-grid">
+              {data.weather.slice(0, 3).map((day, idx) => {
+                const hourlyData = day.hourly?.[4] || day.hourly?.[0] || {};
+                return (
+                  <div key={idx} className="forecast-day-card">
+                    <span className="fc-date">{idx === 0 ? 'Today' : new Date(day.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short' })}</span>
+                    <div className="fc-icon-wrap">
+                      {parseInt(hourlyData.weatherCode) === 113 ? <Sun size={20} className="sunny" /> :
+                       [116, 119, 122].includes(parseInt(hourlyData.weatherCode)) ? <Cloud size={20} className="cloudy" /> :
+                       <CloudRain size={20} className="rainy" />}
+                    </div>
+                    <div className="fc-temps">
+                      <span className="fc-max">{day.maxtempF}°</span>
+                      <span className="fc-min">{day.mintempF}°</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {data.weather?.[0]?.astronomy?.[0] && (
+          <div className="weather-footer">
+            <div className="weather-stat-box">
+              <Sunrise size={14} className="stat-icon" />
+              <div className="stat-value">{data.weather[0].astronomy[0].sunrise}</div>
+            </div>
+            <div className="weather-stat-box">
+              <Sunset size={14} className="stat-icon" />
+              <div className="stat-value">{data.weather[0].astronomy[0].sunset}</div>
+            </div>
+            <div className="weather-stat-box">
+              <Info size={14} className="stat-icon" />
+              <div className="stat-value">UV {current.uvIndex}</div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const ImageModal = ({ images, initialIndex = 0, onClose }) => {
+  const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const [scale, setScale] = useState(1);
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const containerRef = useRef(null);
   const imgRef = useRef(null);
+
+  const currentImage = images[currentIndex];
 
   const handleWheel = (e) => {
     e.preventDefault();
@@ -71,10 +173,30 @@ const ImageModal = ({ src, onClose }) => {
     setIsDragging(false);
   };
 
-  const resetTransform = (e) => {
-    e.stopPropagation();
+  const zoomToFit = (e) => {
+    if (e) e.stopPropagation();
+    if (!imgRef.current) return;
+    const { naturalWidth, naturalHeight } = imgRef.current;
+    if (!naturalWidth) return;
+    
+    // Fit should fill the viewport with margins
+    const scaleX = (window.innerWidth * 0.9) / naturalWidth;
+    const scaleY = (window.innerHeight * 0.9) / naturalHeight;
+    const fitScale = Math.min(scaleX, scaleY);
+    
+    setScale(fitScale);
+    setPosition({ x: 0, y: 0 });
+  };
+
+  const zoomToActual = (e) => {
+    if (e) e.stopPropagation();
     setScale(1);
     setPosition({ x: 0, y: 0 });
+  };
+
+  const resetTransform = (e) => {
+    if (e) e.stopPropagation();
+    zoomToFit();
   };
 
   const zoomIn = (e) => {
@@ -84,28 +206,72 @@ const ImageModal = ({ src, onClose }) => {
 
   const zoomOut = (e) => {
     e.stopPropagation();
-    setScale(prev => Math.max(prev / 1.2, 0.5));
+    setScale(prev => Math.max(prev / 1.2, 0.1));
   };
 
-  // Close on Escape
+  const handleNext = (e) => {
+    if (e) e.stopPropagation();
+    if (currentIndex < images.length - 1) {
+      setCurrentIndex(prev => prev + 1);
+      resetTransform();
+    }
+  };
+
+  const handlePrev = (e) => {
+    if (e) e.stopPropagation();
+    if (currentIndex > 0) {
+      setCurrentIndex(prev => prev - 1);
+      resetTransform();
+    }
+  };
+
+  // Close on Escape, Navigate on Arrows
   useEffect(() => {
-    const handleEsc = (e) => {
+    const handleKey = (e) => {
       if (e.key === 'Escape') onClose();
+      if (e.key === 'ArrowRight') handleNext();
+      if (e.key === 'ArrowLeft') handlePrev();
     };
-    window.addEventListener('keydown', handleEsc);
-    return () => window.removeEventListener('keydown', handleEsc);
-  }, [onClose]);
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [currentIndex]);
+
+  if (!currentImage) return null;
 
   return (
-    <div className="image-modal-overlay" onClick={onClose}>
+    <div className="image-modal-overlay" onClick={onClose} style={{ zIndex: 1200 }}>
       <div className="image-modal-controls no-drag">
+        <div className="index-counter-lite">{currentIndex + 1} / {images.length}</div>
+        <div className="control-divider" />
         <button className="control-btn" onClick={zoomIn} title="Zoom In"><ZoomIn size={20} /></button>
         <button className="control-btn" onClick={zoomOut} title="Zoom Out"><ZoomOut size={20} /></button>
+        <div className="control-divider" />
+        <button className="control-btn" onClick={zoomToFit} title="Zoom to Fit"><Scaling size={20} /></button>
+        <button className="control-btn literal-icon" onClick={zoomToActual} title="1:1 Size">1:1</button>
         <button className="control-btn" onClick={resetTransform} title="Reset"><RotateCcw size={20} /></button>
         <div className="control-divider" />
         <button className="control-btn close" onClick={onClose} title="Close"><X size={20} /></button>
       </div>
       
+      {images.length > 1 && (
+        <>
+          <button 
+            className={`gallery-nav-btn prev ${currentIndex === 0 ? 'disabled' : ''}`}
+            onClick={handlePrev}
+            disabled={currentIndex === 0}
+          >
+            <ChevronLeft size={32} />
+          </button>
+          <button 
+            className={`gallery-nav-btn next ${currentIndex === images.length - 1 ? 'disabled' : ''}`}
+            onClick={handleNext}
+            disabled={currentIndex === images.length - 1}
+          >
+            <ChevronRight size={32} />
+          </button>
+        </>
+      )}
+
       <div 
         className="image-modal-container"
         onWheel={handleWheel}
@@ -117,7 +283,7 @@ const ImageModal = ({ src, onClose }) => {
       >
         <img
           ref={imgRef}
-          src={src}
+          src={currentImage}
           alt="Preview"
           className="modal-image"
           style={{
@@ -131,14 +297,87 @@ const ImageModal = ({ src, onClose }) => {
       </div>
 
       <div className="image-modal-hint">
-        Use mouse wheel to zoom, drag to pan
+        Use arrows to navigate, mouse wheel to zoom, drag to pan
       </div>
     </div>
   );
 };
 
 
-const GeneratedImage = ({ image, onImageClick }) => {
+
+const MediaManagerModal = ({ onClose, onSelectImage }) => {
+  const [images, setImages] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchImages = async () => {
+      try {
+        const resp = await fetch('http://localhost:8345/api/images/cache');
+        if (resp.ok) {
+          const data = await resp.json();
+          setImages(data);
+        }
+      } catch (err) {
+        console.error("Failed to fetch image cache:", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchImages();
+  }, []);
+
+  return (
+    <div className="modal-overlay" style={{ zIndex: 1100 }} onClick={onClose}>
+      <div className="media-manager-content" onClick={(e) => e.stopPropagation()}>
+        <div className="media-header">
+          <div className="title-area">
+            <ImageIcon size={22} className="header-icon" />
+            <h2>Media Manager</h2>
+          </div>
+          <button className="close-btn" onClick={onClose}><X size={20} /></button>
+        </div>
+        
+        <div className="media-grid-container custom-scrollbar">
+          {loading ? (
+            <div className="media-status-state">
+              <div className="spinner"></div>
+              <p>Loading your gallery...</p>
+            </div>
+          ) : images.length === 0 ? (
+            <div className="media-status-state">
+              <ImageIcon size={64} style={{ opacity: 0.1, marginBottom: '20px' }} />
+              <p>Your vault is empty.</p>
+            </div>
+          ) : (
+            <div className="media-grid">
+              {images.map((img) => (
+                <div 
+                  key={img.id} 
+                  className="media-item-card"
+                  onClick={() => onSelectImage(images.map(i => `http://localhost:8345${i.url}`), images.indexOf(img))}
+                >
+                  <div className="media-thumbnail-wrapper">
+                    <img src={`http://localhost:8345${img.url}`} alt={img.prompt} loading="lazy" />
+                  </div>
+                  <div className="media-item-details">
+                    <p className="media-prompt-text">{img.prompt}</p>
+                    <div className="media-meta">
+                      <span className="media-date">{new Date(img.timestamp).toLocaleDateString()}</span>
+                      <span className="media-id-tag">ID: {img.id}</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+
+const GeneratedImage = ({ image, onImageClick, allInTurn = [] }) => {
   if (!image) return (
     <div className="assistant-image-error">
       <ImageIcon size={20} opacity={0.5} />
@@ -163,23 +402,40 @@ const GeneratedImage = ({ image, onImageClick }) => {
         src={src} 
         alt="AI Generated/Captured" 
         className="assistant-image"
-        onClick={() => onImageClick(src)}
+        onClick={() => onImageClick(allInTurn.map(img => {
+            const d = typeof img === 'string' ? img : img.data;
+            return d.startsWith('http') ? d : `data:image/jpeg;base64,${d}`;
+        }), allInTurn.indexOf(image))}
       />
     </div>
   );
 };
 
 
-const MessageContent = ({ content, images = [], onImageClick }) => {
+const MessageContent = ({ content, images = [], weatherData, onImageClick }) => {
+  // Pre-process for math delimiters (converts \( \) and \[ \] to $ and $$) with multiline support
+  const processedContent = (content || '')
+    .replace(/\\\[([\s\S]*?)\\\]/g, '$$$$$1$$$$')
+    .replace(/\\\(([\s\S]*?)\\\)/g, '$$$1$$');
+
   return (
     <div className="message-content-wrapper">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
         className="prose"
         components={{
           code({ node, inline, className, children, ...props }) {
             const match = /language-(\w+)/.exec(className || '');
             const language = match ? match[1] : '';
+            if (language === 'weather') {
+              try {
+                const weatherData = JSON.parse(String(children));
+                return <WeatherWidget data={weatherData} />;
+              } catch (e) {
+                return <code className={className} {...props}>{children}</code>;
+              }
+            }
             return !inline ? (
               <CodeBlock language={language} value={String(children).replace(/\n$/, '')} />
             ) : (
@@ -190,22 +446,26 @@ const MessageContent = ({ content, images = [], onImageClick }) => {
           },
           img({ node, ...props }) {
             return (
-              <div className="markdown-image-container" onClick={() => onImageClick(props.src)}>
+              <div className="markdown-image-container" onClick={() => onImageClick([props.src], 0)}>
                 <img {...props} className="markdown-image" loading="lazy" />
               </div>
             );
           }
         }}
       >
-        {content}
+        {processedContent}
       </ReactMarkdown>
+      
+      {weatherData && <WeatherWidget data={weatherData} />}
+      
       {images.length > 0 && (
         <div className="assistant-images-grid">
           {images.map((img, idx) => (
             <GeneratedImage 
               key={idx} 
               image={img} 
-              onImageClick={onImageClick} 
+              allInTurn={images}
+              onImageClick={onImageClick}
             />
           ))}
         </div>
@@ -215,15 +475,19 @@ const MessageContent = ({ content, images = [], onImageClick }) => {
 };
 
 const App = () => {
-  const [isRecording, setIsRecording] = useState(false);
+  const [selectedImage, setSelectedImage] = useState(null);
+  const [imageGenStatus, setImageGenStatus] = useState({ active: false, percent: 0, preview: null });
   const [messages, setMessages] = useState([]);
   const [interimUserText, setInterimUserText] = useState('');
   const [interimAiText, setInterimAiText] = useState('');
-  const [textInput, setTextInput] = useState('');
-  const [attachments, setAttachments] = useState([]); // {id, name, type, data, preview}
+  const [isRecording, setIsRecording] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [currentModel, setCurrentModel] = useState({ id: '', reason: '' });
-  const [selectedImage, setSelectedImage] = useState(null);
+  const [showMediaManager, setShowMediaManager] = useState(false);
+  const [selectedGallery, setSelectedGallery] = useState(null); // { images: [], index: 0 }
+  const [textInput, setTextInput] = useState('');
+  const [attachments, setAttachments] = useState([]);
+  const [currentModel, setCurrentModel] = useState({ id: null, reason: null });
+  const [isAiAudioPlaying, setIsAiAudioPlaying] = useState(false);
 
   const audioContextRef = useRef(null);
   const streamRef = useRef(null);
@@ -231,6 +495,9 @@ const App = () => {
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
   const textareaRef = useRef(null);
+  const isRecordingRequestedRef = useRef(false);
+  const recordingTimeoutRef = useRef(null);
+  const audioAccumulatorRef = useRef([]);
 
 
 
@@ -248,6 +515,7 @@ const App = () => {
       currentAudioElementRef.current = null;
     }
     isPlayingRef.current = false;
+    setIsAiAudioPlaying(false);
   };
 
   const playNextAudio = () => {
@@ -256,10 +524,16 @@ const App = () => {
       return;
     }
     isPlayingRef.current = true;
+    setIsAiAudioPlaying(true);
     const base64Audio = audioQueueRef.current.shift();
     const audio = new window.Audio("data:audio/wav;base64," + base64Audio);
     currentAudioElementRef.current = audio;
-    audio.onended = playNextAudio;
+    audio.onended = () => {
+      if (audioQueueRef.current.length === 0) {
+        setIsAiAudioPlaying(false);
+      }
+      playNextAudio();
+    };
     audio.play().catch(e => {
       console.error("Audio playback error:", e);
       playNextAudio();
@@ -333,7 +607,14 @@ const App = () => {
         if (!isPlayingRef.current) {
           playNextAudio();
         }
+      } else if (type === 'response.model_switch') {
+        setCurrentModel({ id: lastJsonMessage.model, reason: lastJsonMessage.reason });
+      } else if (type === 'response.image.progress') {
+        setImageGenStatus(prev => ({ ...prev, active: true, percent: lastJsonMessage.percent }));
+      } else if (type === 'response.image.preview') {
+        setImageGenStatus(prev => ({ ...prev, active: true, preview: lastJsonMessage.image }));
       } else if (type === 'response.image.done') {
+        setImageGenStatus({ active: false, percent: 0, preview: null });
         const imageData = { data: lastJsonMessage.image, prompt: lastJsonMessage.full_prompt };
         setMessages(prev => {
           const lastMsg = prev[prev.length - 1];
@@ -347,8 +628,21 @@ const App = () => {
             return [...prev, { role: 'assistant', content: '', images: [imageData] }];
           }
         });
-      } else if (type === 'response.model_switch') {
-        setCurrentModel({ id: lastJsonMessage.model, reason: lastJsonMessage.reason });
+      } else if (type === 'response.weather.done') {
+        const { weather } = lastJsonMessage;
+        setMessages(prev => {
+          const lastMsg = prev[prev.length - 1];
+          if (lastMsg && lastMsg.role === 'assistant') {
+            // Append weather data to existing assistant message if appropriate
+            const updatedLast = {
+              ...lastMsg,
+              weatherData: weather
+            };
+            return [...prev.slice(0, -1), updatedLast];
+          } else {
+            return [...prev, { role: 'assistant', content: '', weatherData: weather }];
+          }
+        });
       }
     }
   }, [lastJsonMessage]);
@@ -439,14 +733,26 @@ const App = () => {
 
 
   const startRecording = async () => {
+    console.log("DEBUG: startRecording called");
     interruptAudio();
     if (isRecording || streamRef.current) {
       console.log("DEBUG: Cleaning up existing microphone stream to prevent overlap leak.");
       stopRecording();
     }
+    setIsRecording(true); // Immediate visual feedback
+    isRecordingRequestedRef.current = true;
     try {
-      console.log("DEBUG: Attempting to start recording...");
+      console.log("DEBUG: Attempting to start userMedia...");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 } });
+      
+      // If user released the key/button while we were waiting, kill it immediately!
+      if (!isRecordingRequestedRef.current) {
+        console.log("DEBUG: User stopped recording before stream was ready. Cancelling.");
+        stream.getTracks().forEach(t => t.stop());
+        setIsRecording(false);
+        return;
+      }
+      
       streamRef.current = stream;
 
       const audioContext = new AudioContext({ sampleRate: 16000 });
@@ -459,24 +765,56 @@ const App = () => {
       const workletNode = new AudioWorkletNode(audioContext, 'audio-processor');
       
       workletNode.port.onmessage = (event) => {
-        const pcmData = convertFloat32To16BitPCM(event.data);
-        const base64Audio = arrayBufferToBase64(pcmData.buffer);
-        sendJsonMessage({ type: 'input_audio_buffer.append', audio: base64Audio });
+        // Accumulate until we have enough to justify a network packet
+        audioAccumulatorRef.current.push(...event.data);
+        
+        if (audioAccumulatorRef.current.length >= 4096) {
+          const pcmData = convertFloat32To16BitPCM(audioAccumulatorRef.current);
+          const base64Audio = arrayBufferToBase64(pcmData.buffer);
+          sendJsonMessage({ type: 'input_audio_buffer.append', audio: base64Audio });
+          audioAccumulatorRef.current = [];
+        }
       };
 
       source.connect(workletNode);
       workletNode.connect(audioContext.destination);
       workletNodeRef.current = workletNode;
-      setIsRecording(true);
+      // setIsRecording already set true above
       sendJsonMessage({ type: "ui.recording.active" });
       console.log("DEBUG: Recording started successfully.");
+      
+      // Auto-stop after 30 seconds as a safety valve
+      if (recordingTimeoutRef.current) clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = setTimeout(() => {
+        if (isRecordingRequestedRef.current) {
+          console.log("DEBUG: Auto-stopping recording (30s limit reached)");
+          stopRecording();
+        }
+      }, 30000);
     } catch (err) {
       console.error('Mic error:', err);
+      setIsRecording(false);
+      alert('Microphone error: ' + err.message);
     }
   };
 
   const stopRecording = () => {
     console.log("DEBUG: Stopping recording...");
+    if (recordingTimeoutRef.current) {
+      clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+    isRecordingRequestedRef.current = false;
+    if (workletNodeRef.current) {
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
+    }
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close().catch(e => console.warn("AudioContext close error:", e));
+      } catch (e) {}
+      audioContextRef.current = null;
+    }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
@@ -486,10 +824,20 @@ const App = () => {
       workletNodeRef.current = null;
     }
     if (audioContextRef.current) {
-      audioContextRef.current.close();
+      try {
+        if (audioContextRef.current.state !== 'closed') {
+          audioContextRef.current.close().catch(e => console.warn("AudioContext close error:", e));
+        }
+      } catch (e) {}
       audioContextRef.current = null;
     }
     setIsRecording(false);
+    if (audioAccumulatorRef.current.length > 0) {
+      const pcmData = convertFloat32To16BitPCM(audioAccumulatorRef.current);
+      const base64Audio = arrayBufferToBase64(pcmData.buffer);
+      sendJsonMessage({ type: 'input_audio_buffer.append', audio: base64Audio });
+      audioAccumulatorRef.current = [];
+    }
     sendJsonMessage({ type: 'input_audio_buffer.commit' });
   };
 
@@ -526,9 +874,14 @@ const App = () => {
             </div>
           )}
         </div>
-        <button className="icon-btn no-drag" onClick={() => setShowSettings(true)}>
-          <SettingsIcon size={18} />
-        </button>
+        <div className="header-actions no-drag">
+          <button className="icon-btn" title="Gallery" onClick={() => setShowMediaManager(true)}>
+            <ImageIcon size={18} />
+          </button>
+          <button className="icon-btn" title="Settings" onClick={() => setShowSettings(true)}>
+            <SettingsIcon size={18} />
+          </button>
+        </div>
       </header>
 
       {showSettings && <Settings onClose={() => setShowSettings(false)} />}
@@ -552,7 +905,8 @@ const App = () => {
             <MessageContent 
               content={msg.content} 
               images={msg.images} 
-              onImageClick={(src) => setSelectedImage(src)}
+              weatherData={msg.weatherData}
+              onImageClick={(gallery, index) => setSelectedGallery({ images: gallery, index })}
             />
           </div>
         ))}
@@ -571,7 +925,46 @@ const App = () => {
             />
           </div>
         )}
+        
+        {imageGenStatus.active && (
+          <div className="message assistant interim image-gen-loading">
+            <div className="image-gen-progress-card">
+              <div className="image-gen-preview-wrapper">
+                {imageGenStatus.preview ? (
+                  <img src={`data:image/png;base64,${imageGenStatus.preview}`} className="image-gen-preview blur-in" alt="Progress" />
+                ) : (
+                  <div className="image-gen-placeholder">
+                    <div className="shimmer"></div>
+                    <ImageIcon size={32} opacity={0.2} />
+                  </div>
+                )}
+                <div className="image-gen-overlay">
+                  <div className="progress-arc-container">
+                    <svg viewBox="0 0 36 36" className="progress-ring">
+                      <path className="ring-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                      <path className="ring-fill" strokeDasharray={`${imageGenStatus.percent}, 100`} d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                    </svg>
+                    <span className="progress-text">{imageGenStatus.percent}%</span>
+                  </div>
+                </div>
+              </div>
+              <div className="image-gen-label">
+                <div className="pulse-dot"></div>
+                Creating Artwork...
+              </div>
+            </div>
+          </div>
+        )}
         <div ref={messagesEndRef} />
+        
+        {isAiAudioPlaying && (
+          <div className="audio-interrupt-float no-drag">
+            <button className="interrupt-btn premium-glass" onClick={interruptAudio} title="Stop AI Voice">
+              <div className="stop-square"></div>
+              <span>STOP READING</span>
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="input-area-wrapper">
@@ -631,12 +1024,14 @@ const App = () => {
             </button>
           ) : (
             <button 
-              className={`mic-btn ${isRecording ? 'recording' : ''}`}
-              onMouseDown={startRecording}
-              onMouseUp={stopRecording}
-              onMouseLeave={isRecording ? stopRecording : undefined}
+              className={`mic-btn no-drag ${isRecording ? 'recording' : ''}`}
+              onClick={(e) => { 
+                e.preventDefault(); 
+                if (isRecording) stopRecording();
+                else startRecording();
+              }}
               disabled={!isConnected}
-              title="Hold to speak"
+              title={isRecording ? "Click to stop" : "Click to speak"}
               style={{ marginBottom: '4px' }}
             >
               {isRecording ? <MicOff size={18} /> : <Mic size={18} />}
@@ -646,10 +1041,21 @@ const App = () => {
         </div>
       </div>
 
-      {selectedImage && (
+      {showMediaManager && (
+        <MediaManagerModal 
+          onClose={() => setShowMediaManager(false)} 
+          onSelectImage={(gallery, index) => {
+            setSelectedGallery({ images: gallery, index });
+            // Don't close MediaManager anymore
+          }}
+        />
+      )}
+
+      {selectedGallery && (
         <ImageModal 
-          src={selectedImage} 
-          onClose={() => setSelectedImage(null)} 
+          images={selectedGallery.images} 
+          initialIndex={selectedGallery.index}
+          onClose={() => setSelectedGallery(null)} 
         />
       )}
     </div>
