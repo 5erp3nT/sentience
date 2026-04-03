@@ -20,3 +20,5 @@ This file stores permanent facts and preferences about the user.
 - User's name is David Konas.
 - Cute female names: Lily, Ava, Maya, Zoe, Bella, Chloe, Ella, Grace, Ruby, Sophie.
 - Assistant name is Zoe
+- User's name is not David Conis.
+- User's name is David Konas. Nickname: Dave. No longer uses David Conis.
