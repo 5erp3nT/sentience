@@ -598,14 +598,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 if transcript and transcript.strip():
                     await process_llm_response(websocket, session_id, transcript, is_audio=True)
 
-            elif message['type'] == 'client.audio_amplitude':
-                amplitude = message.get('amplitude', 0)
-                # Broadcast this amplitude to ALL connected clients (especially the Desktop Modals)
-                await broadcast_to_uis({
-                    "type": "response.audio_amplitude",
-                    "amplitude": amplitude
-                }, session_id=session_id)
-
             elif message['type'] == 'input_text':
                 text_input = message.get('text', '')
                 raw_attachments = message.get('attachments', [])
@@ -640,15 +632,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         except Exception as e:
                             processed_context += f"\n[Error reading file {at['name']}: {e}]\n"
 
-                # Prepend attachment context to user text
-                full_user_text = text_input
-                if processed_context:
-                    full_user_text = f"{processed_context}\nUser Request: {text_input}"
-
                 print(f"DEBUG: Received text input with {len(images_input)} images and {len(raw_attachments) - len(images_input)} documents")
                 
-                if full_user_text.strip() or images_input:
-                    await process_llm_response(websocket, session_id, full_user_text, images_input, is_audio=False)
+                if text_input.strip() or images_input or raw_attachments:
+                    await process_llm_response(websocket, session_id, text_input, images_input, is_audio=False, attachments=raw_attachments, internal_context=processed_context)
 
 
     except Exception:
@@ -1294,14 +1281,16 @@ async def do_run_command(command: str) -> str:
 
 llm_lock = asyncio.Lock()
 
-async def process_llm_response(websocket: WebSocket, session_id: str, user_text: str, images: list = None, is_audio: bool = False):
+async def process_llm_response(websocket: WebSocket, session_id: str, user_text: str, images: list = None, is_audio: bool = False, attachments: list = None, internal_context: str = ""):
     async with llm_lock:
-        await _process_llm_response_locked(websocket, session_id, user_text, images, is_audio=is_audio)
+        await _process_llm_response_locked(websocket, session_id, user_text, images, is_audio=is_audio, attachments=attachments, internal_context=internal_context)
 
-async def _process_llm_response_locked(websocket: WebSocket, session_id: str, user_text: str, images: list = None, is_audio: bool = False):
+async def _process_llm_response_locked(websocket: WebSocket, session_id: str, user_text: str, images: list = None, is_audio: bool = False, attachments: list = None, internal_context: str = ""):
     client_type = socket_to_client_type.get(websocket, "ui")
     if images is None:
         images = []
+    if attachments is None:
+        attachments = []
     settings = load_settings()
     api_key = settings.get("api_key")
     main_model = settings.get("model", "google/gemma-2-9b-it:free")
@@ -1392,15 +1381,29 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         last_session_images[session_id] = images[-5:] # Keep last 5
         
     # ONLY add to memory if it's not already the latest message in history
+    # We store the CLEAN user text (log_text) and the attachment metadata, NOT the huge extracted context.
     recent_check = memory.get_recent_messages(session_id, limit=1)
     if not recent_check or recent_check[0]["content"] != log_text:
-        memory.add_message(session_id, "user", log_text, images=images)
+        # Strip large 'data' from attachments for storage if they exist
+        storable_attachments = []
+        for at in attachments:
+            storable_attachments.append({
+                "name": at.get("name"),
+                "type": at.get("type"),
+                "size": at.get("size", 0) # optional
+            })
+        memory.add_message(session_id, "user", log_text, images=images, attachments=storable_attachments)
+    
+    # Internal prompt text includes the extracted PDF/file context
+    internal_prompt_text = user_text
+    if internal_context:
+        internal_prompt_text = f"{internal_context}\n\nUser Request: {user_text}"
     
     # Tracking images for the assistant's turn persistence
     turn_images = []
     
     # Retrieve relevant history context
-    relevant_facts = memory.search_memory(user_text, top_k=5)
+    relevant_facts = memory.search_memory(internal_prompt_text, top_k=5)
     # ALSO explicitly search for location/identity facts to ensure they are always present
     identity_facts = memory.search_memory("user identity location residence history", top_k=3)
     
@@ -1432,7 +1435,7 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         "- BE CONCISE: Use minimal words. Avoid intros. If the user presents a valid alternative or correction, acknowledge it briefly with logic.\n"
         "- BE AGGRESSIVE: If a tool fails, re-try with the other tool automatically. (e.g., if get_weather fails, use web_search for 'weather in [location]').\n"
         "- US UNITS: ALWAYS use **Fahrenheit** and **Miles**. Strictly avoid Celsius or Kilometers. This is non-negotiable for the user's region.\n"
-        "- CONCISE RESEARCH: For news or web searches, aim for ONE comprehensive query. Summarize ALL relevant findings in your response and then STOP. Do not perform follow-up searches unless the initial results are completely irrelevant or empty.\n"
+        "- CONCISE WEATHER: Use 'get_weather' for weather/forecast. A rich UI report will be displayed automatically. Just provide a 1-sentence summary and STOP. DO NOT include JSON blocks.\n"
         "- NEVER GIVE UP: Don't speculate. If a tool fails, try an alternative.\n"
         "- NO FILLER: Avoid intros. Just solve the user's request.\n"
         "- MATH: Always use LaTeX with dollar signs (`$...$` or `$$...$$`).\n\n"
@@ -1472,8 +1475,8 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
         if is_last and role == "user" and images:
             # Inject multimodal content for the current active turn
             content_array = []
-            # Use user_text if available, fallback to content from DB
-            active_text = user_text if user_text else content
+            # Use internal_prompt_text if it's the current turn
+            active_text = internal_prompt_text if internal_prompt_text else content
             if active_text:
                 content_array.append({"type": "text", "text": active_text})
             
@@ -1497,7 +1500,7 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
     
     try:
         # Agentic loop: keep calling the LLM until it stops requesting tools
-        max_iterations = 10
+        max_iterations = 5
         history_tool_calls = [] # Track calls to detect loops
         for iteration in range(max_iterations):
             # Retry loop for rate limits
@@ -1574,10 +1577,10 @@ async def _process_llm_response_locked(websocket: WebSocket, session_id: str, us
             messages.append(assistant_msg)
             
             if tool_calls:
-                # Show "Thinking..." feedback with iteration progress
+                # Show "Thinking..." feedback
                 await broadcast_to_uis({
                     "type": "response.ai_text.delta",
-                    "delta": f"💭 Thinking (Step {iteration + 1}/10)...\n\n"
+                    "delta": "💭 Thinking...\n\n"
                 }, session_id=session_id)
                 
                 # Execute each tool call and collect results

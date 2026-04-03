@@ -69,13 +69,13 @@ const ModelSelector = ({ label, badge, modelId, setModelId, availableModels, for
           <span className="name">{selectedObj.name}</span>
           <span className="id">{selectedObj.id}</span>
         </div>
-        <ChevronDown size={16} color="var(--text-secondary)" style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }} />
+        <ChevronDown size={18} color="var(--text-secondary)" style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }} />
       </div>
 
       {isOpen && (
         <div className="custom-dropdown">
           <div className="dropdown-search">
-            <Search size={14} color="var(--text-secondary)" />
+            <Search size={16} color="var(--text-secondary)" />
             <input
               ref={searchInputRef}
               type="text"
@@ -97,7 +97,7 @@ const ModelSelector = ({ label, badge, modelId, setModelId, availableModels, for
                   <span className="item-name">{m.name}</span>
                   {parseFloat(m.pricing.prompt) === 0 && <span className="badge free">Free</span>}
                   {m.architecture?.modality?.includes('image') && <span className="badge vision">Vision</span>}
-                  {isActive(m) && <Check size={14} color="var(--accent)" />}
+                  {isActive(m) && <Check size={16} color="var(--accent)" />}
                 </div>
                 <div className="item-id">{m.id}</div>
                 <div className="item-meta">
@@ -128,6 +128,7 @@ const Settings = ({ onClose }) => {
   const [kokoroVoice, setKokoroVoice] = useState('af_bella');
   const [chatterboxVoice, setChatterboxVoice] = useState('default');
   const [assistantName, setAssistantName] = useState('Antigravity');
+  const [enableWaveform, setEnableWaveform] = useState(true);
 
 
   const [systemPrompt, setSystemPrompt] = useState("You are a helpful and concise AI assistant living in the user's Linux status bar.");
@@ -147,8 +148,7 @@ const Settings = ({ onClose }) => {
         setKokoroVoice(data.kokoro_voice || 'af_bella');
         setChatterboxVoice(data.chatterbox_voice || 'default');
         setAssistantName(data.assistant_name || 'Antigravity');
-
-
+        setEnableWaveform(data.enable_waveform !== undefined ? data.enable_waveform : true);
         setSystemPrompt(data.system_prompt || "You are a helpful and concise AI assistant living in the user's Linux status bar.");
       })
       .catch(console.error);
@@ -187,8 +187,7 @@ const Settings = ({ onClose }) => {
           chatterbox_voice: chatterboxVoice,
           assistant_name: assistantName,
           system_prompt: systemPrompt,
-
-
+          enable_waveform: enableWaveform,
         })
       });
       onClose();
@@ -225,7 +224,7 @@ const Settings = ({ onClose }) => {
       <div className="settings-modal flex-col">
         <div className="settings-header">
           <h2>Settings</h2>
-          <button onClick={onClose} className="icon-btn"><X size={20} /></button>
+          <button onClick={onClose} className="icon-btn"><X size={22} /></button>
         </div>
 
         <div className="settings-content">
@@ -291,8 +290,20 @@ const Settings = ({ onClose }) => {
             <div className="form-group">
               <label>
                 Voice Engine (TTS)
-                <span className="badge-inline tools"><Layers size={14} /> Speech Synthesis</span>
+                <span className="badge-inline tools"><Layers size={16} /> Speech Synthesis</span>
               </label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '8px', marginBottom: '8px' }}>
+                <input
+                  type="checkbox"
+                  id="enableWaveform"
+                  checked={enableWaveform}
+                  onChange={e => setEnableWaveform(e.target.checked)}
+                  style={{ width: '16px', height: '16px', cursor: 'pointer', accentColor: 'var(--accent)' }}
+                />
+                <label htmlFor="enableWaveform" style={{ cursor: 'pointer', margin: 0, fontSize: '13px', color: 'var(--text-primary)' }}>
+                  Show waveform while AI is speaking
+                </label>
+              </div>
               <div className="tts-selector-wrapper">
                 <select 
                   value={ttsModel} 
@@ -327,7 +338,7 @@ const Settings = ({ onClose }) => {
                     <option value="bm_george">George (UK-M)</option>
                     <option value="bm_lewis">Lewis (UK-M)</option>
                   </select>
-                  <ChevronDown size={14} className="select-icon-overlay" style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-secondary)' }} />
+                  <ChevronDown size={16} className="select-icon-overlay" style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-secondary)' }} />
                 </div>
               </div>
             ) : (
@@ -345,7 +356,7 @@ const Settings = ({ onClose }) => {
                     <option value="female_lj">Linda (Clear US-Female)</option>
                     <option value="user_cloned">Cloned (Your Voice!)</option>
                   </select>
-                  <ChevronDown size={14} className="select-icon-overlay" style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-secondary)' }} />
+                  <ChevronDown size={16} className="select-icon-overlay" style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-secondary)' }} />
                 </div>
               </div>
             )}
@@ -377,7 +388,7 @@ const Settings = ({ onClose }) => {
 
         <div className="settings-footer">
           <button onClick={handleSave} disabled={loading} className="btn-save">
-            <Save size={16} /> Save Changes
+            <Save size={18} /> Save Changes
           </button>
         </div>
       </div>

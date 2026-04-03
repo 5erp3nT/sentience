@@ -34,9 +34,16 @@ class MemoryManager:
                 session_id TEXT,
                 role TEXT,
                 content TEXT,
+                attachments TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Migration: add attachments if it doesn't exist
+        try:
+            self.conn.execute("ALTER TABLE history ADD COLUMN attachments TEXT")
+            self.conn.commit()
+        except:
+            pass # already exists
         self.conn.execute('''
             CREATE TABLE IF NOT EXISTS history_images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,11 +55,13 @@ class MemoryManager:
         ''')
         self.conn.commit()
 
-    def add_message(self, session_id, role, content, images=None):
+    def add_message(self, session_id, role, content, images=None, attachments=None):
         # 1. Store in SQLite
+        import json
+        attachments_json = json.dumps(attachments) if attachments else None
         cursor = self.conn.execute(
-            "INSERT INTO history (session_id, role, content) VALUES (?, ?, ?)",
-            (session_id, role, content)
+            "INSERT INTO history (session_id, role, content, attachments) VALUES (?, ?, ?, ?)",
+            (session_id, role, content, attachments_json)
         )
         msg_id = cursor.lastrowid
         
@@ -103,9 +112,10 @@ class MemoryManager:
         with open(daily_file, "a") as f:
             time_str = datetime.now().strftime("%H:%M:%S")
             img_marker = f" [Images: {len(images)}]" if images else ""
-            f.write(f"### [{time_str}] {role.upper()}{img_marker}\n{content}\n\n")
+            at_marker = f" [Attachments: {len(attachments)}]" if attachments else ""
+            f.write(f"### [{time_str}] {role.upper()}{img_marker}{at_marker}\n{content}\n\n")
 
-        # 3. Semantic Indexing for user messages
+        # 4. Semantic Indexing for user messages
         if role == 'user':
             doc_id = f"{session_id}_{datetime.now().timestamp()}"
             self.collection.add(
@@ -116,8 +126,8 @@ class MemoryManager:
 
     def get_recent_messages(self, session_id, limit=20):
         cursor = self.conn.execute('''
-            SELECT id, role, content FROM (
-                SELECT id, role, content, timestamp 
+            SELECT id, role, content, attachments FROM (
+                SELECT id, role, content, attachments, timestamp 
                 FROM history 
                 WHERE session_id = ? 
                 ORDER BY timestamp DESC, id DESC 
@@ -126,9 +136,13 @@ class MemoryManager:
         ''', (session_id, limit))
         
         results = []
+        import json
         for row in cursor.fetchall():
-            msg_id, role, content = row
+            msg_id, role, content, attachments_raw = row
+            attachments = json.loads(attachments_raw) if attachments_raw else None
             msg_dict = {"role": role, "content": content}
+            if attachments:
+                msg_dict["attachments"] = attachments
             
             # Fetch associated images
             img_cursor = self.conn.execute(

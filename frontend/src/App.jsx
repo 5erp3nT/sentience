@@ -26,7 +26,7 @@ const CodeBlock = ({ language, value }) => {
       <div className="code-header">
         <span>{language || 'code'}</span>
         <button className="copy-btn" onClick={handleCopy}>
-          {copied ? <Check size={14} /> : <Copy size={14} />}
+          {copied ? <Check size={16} /> : <Copy size={16} />}
           <span>{copied ? 'Copied' : 'Copy'}</span>
         </button>
       </div>
@@ -48,12 +48,12 @@ const WeatherWidget = ({ data }) => {
 
   const getIcon = (code) => {
     const c = parseInt(code);
-    if (c === 113) return <Sun className="weather-icon-main sunny" size={48} />;
-    if ([116, 119, 122].includes(c)) return <Cloud className="weather-icon-main cloudy" size={48} />;
-    if ([176, 263, 266, 281, 293, 296, 299, 302, 305, 308, 311, 353, 356, 359].includes(c)) return <CloudRain className="weather-icon-main rainy" size={48} />;
-    if ([200, 386, 389, 392, 395].includes(c)) return <CloudLightning className="weather-icon-main stormy" size={48} />;
-    if ([179, 227, 230, 323, 326, 329, 332, 335, 338, 368, 371].includes(c)) return <CloudSnow className="weather-icon-main snowy" size={48} />;
-    return <Cloud className="weather-icon-main" size={48} />;
+    if (c === 113) return <Sun className="weather-icon-main sunny" size={52} />;
+    if ([116, 119, 122].includes(c)) return <Cloud className="weather-icon-main cloudy" size={52} />;
+    if ([176, 263, 266, 281, 293, 296, 299, 302, 305, 308, 311, 353, 356, 359].includes(c)) return <CloudRain className="weather-icon-main rainy" size={52} />;
+    if ([200, 386, 389, 392, 395].includes(c)) return <CloudLightning className="weather-icon-main stormy" size={52} />;
+    if ([179, 227, 230, 323, 326, 329, 332, 335, 338, 368, 371].includes(c)) return <CloudSnow className="weather-icon-main snowy" size={52} />;
+    return <Cloud className="weather-icon-main" size={52} />;
   };
 
   return (
@@ -75,17 +75,17 @@ const WeatherWidget = ({ data }) => {
         
         <div className="weather-details-row">
           <div className="weather-stat-box">
-            <Thermometer size={14} className="stat-icon" />
+            <Thermometer size={16} className="stat-icon" />
             <div className="stat-label">Feels Like</div>
             <div className="stat-value">{current.FeelsLikeF}°F</div>
           </div>
           <div className="weather-stat-box">
-            <Wind size={14} className="stat-icon" />
+            <Wind size={16} className="stat-icon" />
             <div className="stat-label">Wind speed</div>
             <div className="stat-value">{current.windspeedMiles} mph</div>
           </div>
           <div className="weather-stat-box">
-            <Droplets size={14} className="stat-icon" />
+            <Droplets size={16} className="stat-icon" />
             <div className="stat-label">Humidity</div>
             <div className="stat-value">{current.humidity}%</div>
           </div>
@@ -101,9 +101,9 @@ const WeatherWidget = ({ data }) => {
                   <div key={idx} className="forecast-day-card">
                     <span className="fc-date">{idx === 0 ? 'Today' : new Date(day.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short' })}</span>
                     <div className="fc-icon-wrap">
-                      {parseInt(hourlyData.weatherCode) === 113 ? <Sun size={20} className="sunny" /> :
-                       [116, 119, 122].includes(parseInt(hourlyData.weatherCode)) ? <Cloud size={20} className="cloudy" /> :
-                       <CloudRain size={20} className="rainy" />}
+                      {parseInt(hourlyData.weatherCode) === 113 ? <Sun size={24} className="sunny" /> :
+                       [116, 119, 122].includes(parseInt(hourlyData.weatherCode)) ? <Cloud size={24} className="cloudy" /> :
+                       <CloudRain size={24} className="rainy" />}
                     </div>
                     <div className="fc-temps">
                       <span className="fc-max">{day.maxtempF}°</span>
@@ -119,15 +119,15 @@ const WeatherWidget = ({ data }) => {
         {data.weather?.[0]?.astronomy?.[0] && (
           <div className="weather-footer">
             <div className="weather-stat-box">
-              <Sunrise size={14} className="stat-icon" />
+              <Sunrise size={16} className="stat-icon" />
               <div className="stat-value">{data.weather[0].astronomy[0].sunrise}</div>
             </div>
             <div className="weather-stat-box">
-              <Sunset size={14} className="stat-icon" />
+              <Sunset size={16} className="stat-icon" />
               <div className="stat-value">{data.weather[0].astronomy[0].sunset}</div>
             </div>
             <div className="weather-stat-box">
-              <Info size={14} className="stat-icon" />
+              <Info size={16} className="stat-icon" />
               <div className="stat-value">UV {current.uvIndex}</div>
             </div>
           </div>
@@ -243,14 +243,14 @@ const ImageModal = ({ images, initialIndex = 0, onClose }) => {
       <div className="image-modal-controls no-drag">
         <div className="index-counter-lite">{currentIndex + 1} / {images.length}</div>
         <div className="control-divider" />
-        <button className="control-btn" onClick={zoomIn} title="Zoom In"><ZoomIn size={20} /></button>
-        <button className="control-btn" onClick={zoomOut} title="Zoom Out"><ZoomOut size={20} /></button>
+        <button className="control-btn" onClick={zoomIn} title="Zoom In"><ZoomIn size={22} /></button>
+        <button className="control-btn" onClick={zoomOut} title="Zoom Out"><ZoomOut size={22} /></button>
         <div className="control-divider" />
-        <button className="control-btn" onClick={zoomToFit} title="Zoom to Fit"><Scaling size={20} /></button>
+        <button className="control-btn" onClick={zoomToFit} title="Zoom to Fit"><Scaling size={22} /></button>
         <button className="control-btn literal-icon" onClick={zoomToActual} title="1:1 Size">1:1</button>
-        <button className="control-btn" onClick={resetTransform} title="Reset"><RotateCcw size={20} /></button>
+        <button className="control-btn" onClick={resetTransform} title="Reset"><RotateCcw size={22} /></button>
         <div className="control-divider" />
-        <button className="control-btn close" onClick={onClose} title="Close"><X size={20} /></button>
+        <button className="control-btn close" onClick={onClose} title="Close"><X size={22} /></button>
       </div>
       
       {images.length > 1 && (
@@ -260,14 +260,14 @@ const ImageModal = ({ images, initialIndex = 0, onClose }) => {
             onClick={handlePrev}
             disabled={currentIndex === 0}
           >
-            <ChevronLeft size={32} />
+            <ChevronLeft size={36} />
           </button>
           <button 
             className={`gallery-nav-btn next ${currentIndex === images.length - 1 ? 'disabled' : ''}`}
             onClick={handleNext}
             disabled={currentIndex === images.length - 1}
           >
-            <ChevronRight size={32} />
+            <ChevronRight size={36} />
           </button>
         </>
       )}
@@ -331,10 +331,10 @@ const MediaManagerModal = ({ onClose, onSelectImage }) => {
       <div className="media-manager-content" onClick={(e) => e.stopPropagation()}>
         <div className="media-header">
           <div className="title-area">
-            <ImageIcon size={22} className="header-icon" />
+            <ImageIcon size={24} className="header-icon" />
             <h2>Media Manager</h2>
           </div>
-          <button className="close-btn" onClick={onClose}><X size={20} /></button>
+          <button className="close-btn" onClick={onClose}><X size={22} /></button>
         </div>
         
         <div className="media-grid-container custom-scrollbar">
@@ -345,7 +345,7 @@ const MediaManagerModal = ({ onClose, onSelectImage }) => {
             </div>
           ) : images.length === 0 ? (
             <div className="media-status-state">
-              <ImageIcon size={64} style={{ opacity: 0.1, marginBottom: '20px' }} />
+              <ImageIcon size={72} style={{ opacity: 0.1, marginBottom: '20px' }} />
               <p>Your vault is empty.</p>
             </div>
           ) : (
@@ -380,7 +380,7 @@ const MediaManagerModal = ({ onClose, onSelectImage }) => {
 const GeneratedImage = ({ image, onImageClick, allInTurn = [] }) => {
   if (!image) return (
     <div className="assistant-image-error">
-      <ImageIcon size={20} opacity={0.5} />
+      <ImageIcon size={22} opacity={0.5} />
       <span>Missing image data</span>
     </div>
   );
@@ -389,7 +389,7 @@ const GeneratedImage = ({ image, onImageClick, allInTurn = [] }) => {
 
   if (!data) return (
     <div className="assistant-image-error">
-      <X size={20} color="#ff4444" />
+      <X size={22} color="#ff4444" />
       <span>Malformed image payload</span>
     </div>
   );
@@ -412,7 +412,7 @@ const GeneratedImage = ({ image, onImageClick, allInTurn = [] }) => {
 };
 
 
-const MessageContent = ({ content, images = [], weatherData, onImageClick }) => {
+const MessageContent = ({ content, images = [], attachments = [], weatherData, onImageClick }) => {
   // Pre-process for math delimiters (converts \( \) and \[ \] to $ and $$) with multiline support
   const processedContent = (content || '')
     .replace(/\\\[([\s\S]*?)\\\]/g, '$$$$$1$$$$')
@@ -458,6 +458,17 @@ const MessageContent = ({ content, images = [], weatherData, onImageClick }) => 
       
       {weatherData && <WeatherWidget data={weatherData} />}
       
+      {attachments && attachments.length > 0 && (
+        <div className="message-attachments">
+          {attachments.map((at, idx) => (
+            <div key={idx} className="attachment-chip historical">
+              <FileText size={16} className="chip-icon" />
+              <span className="chip-name">{at.name}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      
       {images.length > 0 && (
         <div className="assistant-images-grid">
           {images.map((img, idx) => (
@@ -470,6 +481,88 @@ const MessageContent = ({ content, images = [], weatherData, onImageClick }) => 
           ))}
         </div>
       )}
+    </div>
+  );
+};
+
+const VoicePlaybackOverlay = ({ analyser }) => {
+  const canvasRef = useRef(null);
+  const animationRef = useRef(null);
+
+  useEffect(() => {
+    if (!analyser || !canvasRef.current) return;
+
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+
+    const draw = () => {
+      animationRef.current = requestAnimationFrame(draw);
+      analyser.getByteFrequencyData(dataArray);
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const centerX = canvas.width / 2;
+      const centerY = canvas.height / 2;
+      const radius = 85;
+      
+      // Use a subset of bins for better speech visualization (ignore high frequency silence)
+      const activeBins = Math.floor(bufferLength * 0.6); 
+      
+      // Draw circular waveform with symmetry
+      ctx.beginPath();
+      ctx.strokeStyle = 'rgba(0, 255, 230, 0.9)';
+      ctx.lineWidth = 3;
+      ctx.shadowBlur = 15;
+      ctx.shadowColor = 'rgba(0, 255, 200, 0.4)';
+
+      for (let i = 0; i < activeBins; i++) {
+        const value = dataArray[i];
+        const percent = value / 255;
+        const barHeight = percent * 45; 
+        
+        // Map the bins to the full circle
+        const angle = (i / activeBins) * Math.PI * 2;
+        
+        const x1 = centerX + Math.cos(angle) * radius;
+        const y1 = centerY + Math.sin(angle) * radius;
+        const x2 = centerX + Math.cos(angle) * (radius + barHeight);
+        const y2 = centerY + Math.sin(angle) * (radius + barHeight);
+
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+      }
+      ctx.stroke();
+
+      // Additional pulsing glow
+      const avgValue = dataArray.slice(0, activeBins).reduce((a, b) => a + b, 0) / activeBins;
+      const pulseSize = (avgValue / 255) * 12;
+
+      ctx.beginPath();
+      const gradient = ctx.createRadialGradient(centerX, centerY, radius - 5, centerX, centerY, radius + 10 + pulseSize);
+      gradient.addColorStop(0, 'rgba(0, 255, 230, 0.2)');
+      gradient.addColorStop(0.5, 'rgba(0, 255, 230, 0.1)');
+      gradient.addColorStop(1, 'rgba(0, 255, 230, 0)');
+      ctx.fillStyle = gradient;
+      ctx.arc(centerX, centerY, radius + 10 + pulseSize, 0, Math.PI * 2);
+      ctx.fill();
+    };
+
+    draw();
+    return () => {
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+    };
+  }, [analyser]);
+
+  return (
+    <div className="voice-overlay-container">
+      <div className="voice-overlay-backdrop">
+        <img src="/voice-bg.png" alt="Voice Background" className="voice-bg-img" />
+        <div className="voice-overlay-vignette"></div>
+      </div>
+      <canvas ref={canvasRef} width={600} height={600} className="voice-canvas" />
+      <div className="voice-status-label">SENTIENCE SPEAKING</div>
     </div>
   );
 };
@@ -497,9 +590,6 @@ const App = () => {
   const textareaRef = useRef(null);
   const isRecordingRequestedRef = useRef(false);
   const recordingTimeoutRef = useRef(null);
-  const playbackAnalyserRef = useRef(null);
-  const playbackDataArrayRef = useRef(null);
-  const playbackAnimationRef = useRef(null);
   const audioAccumulatorRef = useRef([]);
 
 
@@ -507,6 +597,8 @@ const App = () => {
   const audioQueueRef = useRef([]);
   const isPlayingRef = useRef(false);
   const currentAudioElementRef = useRef(null);
+  const playbackAudioContextRef = useRef(null);
+  const playbackAnalyserRef = useRef(null);
 
   const interruptAudio = () => {
     audioQueueRef.current = []; // Clear pending audio
@@ -517,74 +609,47 @@ const App = () => {
       } catch (e) {}
       currentAudioElementRef.current = null;
     }
-    if (playbackAnimationRef.current) {
-      cancelAnimationFrame(playbackAnimationRef.current);
-      playbackAnimationRef.current = null;
-    }
-    // Final clear amplitude
-    sendJsonMessage({ type: 'client.audio_amplitude', amplitude: 0 });
     isPlayingRef.current = false;
     setIsAiAudioPlaying(false);
-  };
-
-  const broadcastAmplitude = () => {
-    if (!playbackAnalyserRef.current) return;
-    playbackAnalyserRef.current.getByteTimeDomainData(playbackDataArrayRef.current);
-    let sum = 0;
-    for (let i = 0; i < playbackDataArrayRef.current.length; i++) {
-      const val = (playbackDataArrayRef.current[i] - 128) / 128;
-      sum += val * val;
-    }
-    const rms = Math.sqrt(sum / playbackDataArrayRef.current.length);
-    const amp = Math.min(1.0, rms * 15.0); // MASSIVELY increased sensitivity
-    sendJsonMessage({ type: 'client.audio_amplitude', amplitude: amp });
-    playbackAnimationRef.current = requestAnimationFrame(broadcastAmplitude);
   };
 
   const playNextAudio = () => {
     if (audioQueueRef.current.length === 0) {
       isPlayingRef.current = false;
-      setIsAiAudioPlaying(false);
-      if (playbackAnimationRef.current) {
-        cancelAnimationFrame(playbackAnimationRef.current);
-        playbackAnimationRef.current = null;
-      }
-      sendJsonMessage({ type: 'client.audio_amplitude', amplitude: 0 });
       return;
     }
-    
     isPlayingRef.current = true;
     setIsAiAudioPlaying(true);
+
+    if (!playbackAudioContextRef.current) {
+      playbackAudioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      playbackAnalyserRef.current = playbackAudioContextRef.current.createAnalyser();
+      playbackAnalyserRef.current.fftSize = 512;
+      playbackAnalyserRef.current.connect(playbackAudioContextRef.current.destination);
+    }
+
     const base64Audio = audioQueueRef.current.shift();
     const audio = new window.Audio("data:audio/wav;base64," + base64Audio);
     
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    
-    if (!playbackAnalyserRef.current) {
-      playbackAnalyserRef.current = audioContextRef.current.createAnalyser();
-      playbackAnalyserRef.current.fftSize = 256;
-      playbackDataArrayRef.current = new Uint8Array(playbackAnalyserRef.current.frequencyBinCount);
-    }
-    
-    const source = audioContextRef.current.createMediaElementSource(audio);
+    // Connect to visualizer
+    const source = playbackAudioContextRef.current.createMediaElementSource(audio);
     source.connect(playbackAnalyserRef.current);
-    playbackAnalyserRef.current.connect(audioContextRef.current.destination);
-    
+
     currentAudioElementRef.current = audio;
     audio.onended = () => {
+      if (audioQueueRef.current.length === 0) {
+        setIsAiAudioPlaying(false);
+      }
       playNextAudio();
     };
     
-    // Explicitly resume in case of browser-enforced suspension
-    audioContextRef.current.resume().then(() => {
-      audio.play().then(() => {
-        if (!playbackAnimationRef.current) broadcastAmplitude();
-      }).catch(e => {
-        console.error("Audio playback error:", e);
-        playNextAudio();
-      });
+    if (playbackAudioContextRef.current.state === 'suspended') {
+      playbackAudioContextRef.current.resume();
+    }
+
+    audio.play().catch(e => {
+      console.error("Audio playback error:", e);
+      playNextAudio();
     });
   };
 
@@ -924,10 +989,10 @@ const App = () => {
         </div>
         <div className="header-actions no-drag">
           <button className="icon-btn" title="Gallery" onClick={() => setShowMediaManager(true)}>
-            <ImageIcon size={18} />
+            <ImageIcon size={20} />
           </button>
           <button className="icon-btn" title="Settings" onClick={() => setShowSettings(true)}>
-            <SettingsIcon size={18} />
+            <SettingsIcon size={20} />
           </button>
         </div>
       </header>
@@ -935,6 +1000,7 @@ const App = () => {
       {showSettings && <Settings onClose={() => setShowSettings(false)} />}
 
       <div className="messages-area">
+        {isAiAudioPlaying && <VoicePlaybackOverlay analyser={playbackAnalyserRef.current} />}
         {isRecording && (
           <div className="recording-overlay">
             <div className="recording-pulse"></div>
@@ -943,7 +1009,7 @@ const App = () => {
         )}
         {messages.length === 0 && !interimUserText && !interimAiText && !isRecording && (
           <div className="empty-state">
-            <MessageSquare size={32} opacity={0.3} />
+            <MessageSquare size={36} opacity={0.3} />
             <p>Ready for Alt + \ command</p>
           </div>
         )}
@@ -953,6 +1019,7 @@ const App = () => {
             <MessageContent 
               content={msg.content} 
               images={msg.images} 
+              attachments={msg.attachments}
               weatherData={msg.weatherData}
               onImageClick={(gallery, index) => setSelectedGallery({ images: gallery, index })}
             />
@@ -983,7 +1050,7 @@ const App = () => {
                 ) : (
                   <div className="image-gen-placeholder">
                     <div className="shimmer"></div>
-                    <ImageIcon size={32} opacity={0.2} />
+                    <ImageIcon size={36} opacity={0.2} />
                   </div>
                 )}
                 <div className="image-gen-overlay">
@@ -1004,31 +1071,16 @@ const App = () => {
           </div>
         )}
         <div ref={messagesEndRef} />
-        
-        {isAiAudioPlaying && (
-          <div className="audio-interrupt-float no-drag" style={{ 
-            position: 'fixed', 
-            bottom: '80px', 
-            left: '50%', 
-            transform: 'translateX(-50%)', 
-            zIndex: 9999,
-            display: 'flex',
-            justifyContent: 'center',
-            width: '100%',
-            pointerEvents: 'none'
-          }}>
-            <button 
-              className="interrupt-btn premium-glass" 
-              onClick={interruptAudio} 
-              title="Stop AI Voice"
-              style={{ pointerEvents: 'auto' }}
-            >
-              <div className="stop-square"></div>
-              <span>STOP READING</span>
-            </button>
-          </div>
-        )}
       </div>
+
+      {isAiAudioPlaying && (
+        <div className="audio-interrupt-bar no-drag">
+          <button className="interrupt-btn premium-glass" onClick={interruptAudio} title="Stop AI Voice">
+            <div className="stop-square"></div>
+            <span>STOP READING</span>
+          </button>
+        </div>
+      )}
 
       <div className="input-area-wrapper">
         {attachments.length > 0 && (
@@ -1038,11 +1090,11 @@ const App = () => {
                 {at.preview ? (
                   <img src={at.preview} alt="preview" className="chip-thumb" />
                 ) : (
-                  <FileText size={14} className="chip-icon" />
+                  <FileText size={16} className="chip-icon" />
                 )}
                 <span className="chip-name">{at.name}</span>
                 <button className="chip-remove" onClick={() => removeAttachment(at.id)}>
-                  <X size={12} />
+                  <X size={14} />
                 </button>
               </div>
             ))}
@@ -1062,7 +1114,7 @@ const App = () => {
             onClick={() => fileInputRef.current?.click()}
             title="Attach files or images"
           >
-            <Paperclip size={20} />
+            <Paperclip size={22} />
           </button>
           
           <textarea 
@@ -1083,7 +1135,7 @@ const App = () => {
           
           {(textInput.trim() || attachments.length > 0) ? (
             <button className="send-btn" onClick={handleSendText} style={{ marginBottom: '4px' }}>
-              <Send size={18} />
+              <Send size={20} />
             </button>
           ) : (
             <button 
@@ -1097,7 +1149,7 @@ const App = () => {
               title={isRecording ? "Click to stop" : "Click to speak"}
               style={{ marginBottom: '4px' }}
             >
-              {isRecording ? <MicOff size={18} /> : <Mic size={18} />}
+              {isRecording ? <MicOff size={20} /> : <Mic size={20} />}
             </button>
           )}
 
